@@ -308,7 +308,10 @@ account, no trading API keys.
 
 ## 10. Open questions
 
-- Which broker's MT5 does the owner trade on? Needed for the price comparison. (Phase 3)
+- ~~Which broker's MT5 does the owner trade on?~~ Answered 2026-11-11: MOT Capital,
+  MT5 demo account, leverage 1:500, web terminal at mt5-demo.motcapital.com/terminal.
+  Phase 3 compares the feed with this terminal's gold price. The exact gold
+  symbol name and its spread at MOT Capital are still to be read from the terminal.
 - Is M15 still the main timeframe? (Phase 4)
 - Which email addresses receive signals, and which Gmail account sends them? (Phase 6)
 - Server: Oracle's free server, or the owner's own computer running 24/7?
