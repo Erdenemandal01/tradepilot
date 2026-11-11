@@ -34,6 +34,8 @@ Signals only. Full plan: docs/PLAN.md.
 - Python 3.11+, type hints, small pure functions.
 - Times are UTC Unix seconds everywhere.
 - Lightweight Charts v5 API: chart.addSeries(CandlestickSeries, ...), createSeriesMarkers(...).
+- Web UI text is Mongolian (Cyrillic). Look and layout follow docs/PLAN.md section 11,
+  which the owner approved from a mock-up on 2026-11-11.
 
 ## Status
 - Phase 0 (repo and environment): done.

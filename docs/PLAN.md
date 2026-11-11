@@ -279,7 +279,7 @@ is ever produced from a made-up price.
 | 4. Backtest | History download script, `core/backtest.py`, report | Engine tests pass: SL first when a candle touches both; no future candles used. The M15 report exists. | history download |
 | 5. Filters | `core/filters.py`: H1 confirmation, calendar window, duplicates | Each filter's tests pass. A backtest with and without the H1 filter is compared. | calendar API |
 | 6. Worker and email | 24/7 loop, SQLite, notifications, outcome tracking | A test signal arrives by email within 1 minute. Cutting the source produces an alert. | SMTP account |
-| 7. Web | API, login, dark dashboard | A request without login gets 401. Chart, signal, log and metrics are visible. | no |
+| 7. Web | API, login, dark dashboard in Mongolian (section 11) | A request without login gets 401. Chart, signal, log and metrics are visible. | no |
 | 8. AI digest | RSS headlines, Gemini, grades | A structured digest appears every hour. When the AI fails, signals still go out with grade B. | Gemini API |
 | 9. Deployment | Docker Compose, HTTPS, data backup | After a server restart everything comes back by itself. 72 hours without interruption. | server |
 | 10. Observation | Log signals for 2 to 4 weeks | A report compares live results with the backtest, and a decision on next steps is made. | no |
@@ -305,6 +305,25 @@ Phase 3 findings so far (2026-11-11):
 - Data terms: Binance and Twelve Data display rights are not yet checked.
 - Dev PC: Windows Smart App Control blocks pandas 3.x DLLs, so
   requirements pin pandas below 3.
+- Code review of 2026-11-11 (docs/reviews/2026-11-11-phase3-review.md): 25
+  findings, most still unverified because the review was cut short. Fixed so
+  far: a candle counts as closed only when the source lists a newer one
+  (Binance can serve a just-closed candle in a pre-close state for a few
+  seconds, and the PC clock can be wrong); transport errors and a locked CSV
+  no longer stop the collector; `check_candles` compares every saved candle
+  with the source. Open and worth deciding before Phase 4: weekend candles
+  of the 24/7 Binance contract reach the indicators as if XAUUSD had traded;
+  the price-comparison verdict depends on when the report is run.
+
+Early observation for Phases 4 and 5 (2026-11-11; an ad hoc script on real
+Binance candles made while preparing the UI mock-up, not a backtest): with
+the H1 filter and the duplicate rule as written, a trend produces a
+same-direction signal every 30 minutes (21 signals on 2026-11-11). In that
+55-hour window 13 of 60 signals reached TP before SL, against a 42.9%
+break-even. The sample is far too small and too correlated to conclude
+from, and it ignores spread and the news filter; Phase 4 measures this
+properly. The duplicate rule probably needs to be stricter, for example no
+new signal while an earlier one in the same direction is still open.
 
 ## 9. Safety and limits
 
@@ -339,3 +358,73 @@ account, no trading API keys.
 - Server: Oracle's free server, or the owner's own computer running 24/7?
   Oracle sign-up may require a card. (Phase 9)
 - Buy a domain name for the site? Needed for HTTPS. (Phase 9)
+- Should the signal emails be in Mongolian too, like the site? (Phase 6)
+- Show times in Ulaanbaatar time (UTC+8) on the site and in emails? (Phases 6 and 7)
+
+## 11. Web UI direction (Phase 7)
+
+The owner's requests of 2026-11-11. Not yet in the Mongolian original of this plan.
+
+1. Language: the whole site is in Mongolian (Cyrillic). Market terms that
+   traders already use stay as they are: XAUUSD, BUY, SELL, SL, TP, M15, H1,
+   ATR, RSI.
+2. Easy to use: the current signal and what to do with it must be readable
+   in a few seconds, without scrolling or clicking, on a laptop and on a phone.
+3. Look: a dark "control room" dashboard built from cards, like the reference
+   image the owner shared (a stock "space habitat operations dashboard"
+   vector): deep navy background, rounded cards with thin borders, a slim top
+   bar with a status pill, a row of small KPI tiles, chart cards, list cards
+   with coloured status pills and thin progress bars, an alerts card, small
+   uppercase card labels. The owner prefers this to a pure TradingView look.
+4. Chart: take the chart's conventions from TradingView (tradingview.com):
+   candles on a dark grid, the price scale on the right with a last-price
+   tag, a legend with O H L C on the top-left, a timeframe switch above it.
+
+Inspiration, not copies: no logos, artwork, icons or page assets from either
+source, and our own name on the site.
+
+Layout. The owner approved this direction on 2026-11-11 from a mock-up (the
+design canvas "TradePilot самбарын загвар" in the owner's Claude account: the
+desktop page, the phone layout and the other states of the signal card):
+
+- Top bar: site name, a status pill for feed and worker with the price age,
+  the date and time, log out.
+- Left rail: icon links to the sections. On a phone it becomes a row.
+- Signal card, first in reading order and first on a phone: side, a
+  valid-for countdown with a bar, grade and status chips, the entry zone
+  with the reference price and whether the current price is inside it, SL
+  and TP with their distances from the fill price, a three-step "if you
+  enter" note, the not-advice line.
+- KPI tiles: price and its source, signals today, the next high-impact
+  event, the rule status ("experimental" until the backtest gate is passed).
+- Chart card (M15 / H1 switch): candles, BUY / SELL markers, the entry zone
+  as a band over the validity window, SL and TP as dashed lines with price
+  tags.
+- Reasons strip under the chart: the score, the five conditions with
+  +1 / 0 / -1, the H1 score, RSI and ATR.
+- Lower cards: signal log with outcomes; economic calendar; AI digest;
+  statistics (backtest and live); system alerts.
+- Footer: a status legend and the signals-only disclaimer.
+- The signal card without a signal: HOLD with the score; blocked, with the
+  reason (news window and the other reason codes); feed down.
+- Phone: the same page in one column.
+
+Constraints:
+
+- Signals only: no order, buy or sell buttons anywhere (hard rule).
+- Prices come only from our stored feed. Do not embed TradingView's own
+  widgets: they show TradingView's prices, not the ones a signal was
+  computed from.
+- The chart library is TradingView's open-source Lightweight Charts v5
+  (Apache 2.0). Its licence asks for attribution: keep the chart's
+  attribution logo on (`layout.attributionLogo`, on by default) or show the
+  notice and a link to tradingview.com on the page.
+- Fonts must cover Mongolian Cyrillic (Ө, Ү). Pages are UTF-8 with
+  `lang="mn"`. Prices keep the broker's format (4062.08).
+- Times stay UTC Unix seconds in storage and in the API. What the site
+  displays (Ulaanbaatar time is proposed) is an open question above.
+- Colour is never the only carrier of meaning: BUY / SELL and every status
+  also carry a word or an icon, not just green or red.
+- Every page behind login (hard rule).
+
+Before building, look at tradingview.com again: details change.
