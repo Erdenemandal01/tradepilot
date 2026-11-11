@@ -12,20 +12,20 @@ XAUUSD-ийн ханш, мэдээг 24/7 шинжилж, орох бүс, SL, T
 | 0 | Repo ба орчин, `/api/health` | Дууссан |
 | 1 | Индикатор: EMA, RSI, MACD, ATR | Дууссан |
 | 2 | Онооны дүрэм, түвшин, орох бүс | Дууссан |
-| 3 | Ханшийн эх үүсвэр | Дараагийн алхам |
+| 3 | Ханшийн эх үүсвэр | Код бэлэн; 24 цагийн цуглуулга, MT5-тай 20 харьцуулалт хүлээгдэж байна |
 | 4–10 | Backtest, шүүлтүүр, worker, вэб, AI нэгтгэл, байршуулалт, ажиглалт | Хүлээгдэж буй |
 
-Одоогоор сигнал гаргадаг цөм бэлэн, гэхдээ бодит ханштай холбогдоогүй.
+Сигнал гаргадаг цөм бэлэн, Binance XAUUSDT-ээс бодит ханш татаж чаддаг.
 Онооны дүрэм backtest-ээр шалгагдаагүй тул «туршилтын» гэж үзнэ.
 
 ## Эхлүүлэх
 
 Python 3.11 эсвэл түүнээс шинэ хувилбар хэрэгтэй.
 
-Windows PowerShell:
+Windows PowerShell (`python` ажиллахгүй бол `py` гэж бичнэ):
 
 ```powershell
-python -m venv .venv
+py -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 pytest -q
@@ -48,13 +48,45 @@ uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 {"status":"ok","version":"0.1.0","symbol":"XAUUSD","feed":"not_configured","worker":"not_running"}
 ```
 
+## 3-р шат: ханшийн эх үүсвэрийг шалгах
+
+Анхдагч эх үүсвэр нь Binance XAUUSDT (түлхүүр шаардахгүй). Twelve Data-г
+хэрэглэх бол `.env`-д `TRADEPILOT_TWELVEDATA_API_KEY`-г бичнэ.
+
+1. **24 цаг тасралтгүй цуглуулах.** Компьютер унтахгүй, интернет тасрахгүй байх ёстой:
+
+   ```powershell
+   .venv\Scripts\python -m backend.scripts.collect_candles --hours 24
+   ```
+
+   Дуусаад (эсвэл явцад нь) тасалдал байгаа эсэхийг шалгана:
+
+   ```powershell
+   .venv\Scripts\python -m backend.scripts.check_candles data/collect_binance_M15.csv
+   ```
+
+2. **MOT Capital MT5-тай 20 удаа харьцуулах.** Өөр өөр цагт хийнэ:
+
+   ```powershell
+   .venv\Scripts\python -m backend.scripts.compare_prices
+   ```
+
+   MT5 дээр XAUUSD-ийн bid/ask-ийг харах агшинд Enter дарж, харсан
+   тоонуудаа `4062.08 4062.21` гэж бичнэ. Дүгнэлт:
+
+   ```powershell
+   .venv\Scripts\python -m backend.scripts.compare_prices --report
+   ```
+
+Үр дүн `data/`-д хадгалагдана (git-д орохгүй).
+
 ## Claude Code дээр үргэлжлүүлэх
 
 Repo-г Claude Code-д нээгээд дараах даалгаврыг өгнө:
 
 ```text
-CLAUDE.md болон docs/PLAN.md-г унш. Зөвхөн 3-р шатыг хий.
-Дуусаад хүлээн авах шалгуур бүрийн гаралтыг харуул.
+CLAUDE.md болон docs/PLAN.md-г унш. 3-р шатын шалгуурын үр дүнг хар,
+эх үүсвэрийг сонгоход тусал. 4-р шатыг асуухгүйгээр бүү эхлүүл.
 ```
 
 ## Бүтэц
@@ -64,6 +96,10 @@ backend/app/main.py              FastAPI app, /api/health
 backend/app/config.py            .env тохиргоо (TRADEPILOT_ угтвартай)
 backend/app/core/indicators.py   EMA, RSI, MACD, ATR
 backend/app/core/signal.py       5 нөхцөлийн оноо, BUY / SELL / HOLD, түвшин
+backend/app/core/candles.py      лааны шалгалт, тасалдал, M15 -> H1
+backend/app/core/pricecheck.py   эх үүсвэр ба брокерийн ханшийн зөрүү
+backend/app/datasource/          Binance, Twelve Data, CSV эх үүсвэр
+backend/scripts/                 цуглуулах, тасалдал шалгах, ханш харьцуулах
 backend/tests/                   pytest
 docs/PLAN.md                     төлөвлөгөө (англи ажлын хувилбар)
 ```

@@ -41,7 +41,7 @@ only when measurement shows it is the bottleneck.
 
 | Part | Free option | Trade-off | Paid fallback |
 | --- | --- | --- | --- |
-| Price | Binance XAUUSDT perpetual, public market data | Not spot XAUUSD, so it differs from the broker's price. Keyless candle access and reachability from the server region must be tested in Phase 3. | none |
+| Price | Binance XAUUSDT perpetual, public market data | Not spot XAUUSD, so it differs from the broker's price. Keyless access confirmed from the owner's network on 2026-11-11; reachability from the server region is checked in Phase 9. Listed 2025-12-11, so history is short. | none |
 | Price, backup | Twelve Data Basic: 8 credits/min, 800 requests/day | Unclear whether XAU/USD is on the free plan; "internal non-display usage only". | Grow, $29/month |
 | Server | Oracle Cloud Always Free (Arm, 2 OCPU / 12 GB) | Free terms were halved in June 2026 and can change again. | small VPS |
 | Server, backup | Owner's own computer, always on | Signals stop when the PC or its internet is down. | small VPS |
@@ -108,11 +108,14 @@ tradepilot/
 │  │  ├─ notify.py             # email (SMTP)
 │  │  ├─ core/
 │  │  │  ├─ indicators.py      # EMA, RSI, MACD, ATR
+│  │  │  ├─ candles.py         # candle schema, gaps, M15 -> H1 aggregation
+│  │  │  ├─ pricecheck.py      # feed vs broker price report
 │  │  │  ├─ signal.py          # score, levels, entry zone
 │  │  │  ├─ filters.py         # H1 confirmation, news window, grade
 │  │  │  └─ backtest.py        # engine, metrics
 │  │  ├─ datasource/
 │  │  │  ├─ base.py            # DataSource interface
+│  │  │  ├─ http.py            # stdlib JSON client
 │  │  │  ├─ binance_source.py
 │  │  │  ├─ twelvedata_source.py
 │  │  │  └─ csv_source.py
@@ -120,7 +123,7 @@ tradepilot/
 │  │     ├─ calendar.py        # economic calendar
 │  │     ├─ headlines.py       # RSS headlines
 │  │     └─ digest.py          # AI digest
-│  ├─ scripts/                 # history download, backtest runner
+│  ├─ scripts/                 # candle collector, gap check, price comparison; history download, backtest runner
 │  └─ tests/
 ├─ frontend/
 └─ data/                       # SQLite, CSV; not in git
@@ -285,7 +288,23 @@ Stop after Phase 4 and review the backtest gate together with the owner.
 Even without passing the gate, signals may flow from Phase 6 with the status
 "experimental" while the rules are improved.
 
-Status: Phases 0, 1 and 2 are done.
+Status: Phases 0, 1 and 2 are done. Phase 3 code is done (2026-11-11); its
+acceptance checks wait on the owner: a 24-hour collection run
+(`collect_candles` then `check_candles`) and 20 MT5 readings
+(`compare_prices`, then `--report`). Then a source is chosen.
+
+Phase 3 findings so far (2026-11-11):
+- Binance XAUUSDT answers keyless from the owner's network (Mongolia):
+  klines and bookTicker both work. Binance spread was 0.01.
+- The contract (`TRADIFI_PERPETUAL`) was listed on 2025-12-11, so Binance has
+  only about 11 months of history. That limits Phase 4: check that the last
+  30% still holds 100 trades, or take history from another source.
+- Twelve Data needs the owner's free API key; the adapter is tested against
+  recorded response shapes only. Whether XAU/USD is on the free plan is
+  still unknown.
+- Data terms: Binance and Twelve Data display rights are not yet checked.
+- Dev PC: Windows Smart App Control blocks pandas 3.x DLLs, so
+  requirements pin pandas below 3.
 
 ## 9. Safety and limits
 

@@ -52,3 +52,27 @@ def test_core_imports_only_pure_calculation_modules():
             assert root in ALLOWED_CORE_IMPORTS, f"core/{path.name} imports {module}"
             if root == "backend":
                 assert module.startswith("backend.app.core"), f"core/{path.name} imports {module}"
+
+
+# Rule: price sources read public market data only. No account or order
+# endpoints, no signed requests, no exchange API-key headers.
+DATASOURCE_DIR = APP_DIR / "datasource"
+FORBIDDEN_DATASOURCE_TOKENS = (
+    "/order",
+    "/account",
+    "/positionRisk",
+    "/leverage",
+    "/listenKey",
+    "signature",
+    "X-MBX-APIKEY",
+    "POST",
+)
+
+
+def test_price_sources_use_public_market_data_only():
+    files = _python_files(DATASOURCE_DIR)
+    assert files, "no datasource files found"
+    for path in files:
+        source = path.read_text(encoding="utf-8")
+        for token in FORBIDDEN_DATASOURCE_TOKENS:
+            assert token not in source, f"datasource/{path.name} mentions {token}"

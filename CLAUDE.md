@@ -21,8 +21,12 @@ Signals only. Full plan: docs/PLAN.md.
 - Stop after Phase 4 and report the backtest results.
 
 ## Commands
+- Windows dev PC: `python` is the Store stub; use `py -m venv .venv`, then `.venv\Scripts\python`.
 - Install: pip install -r requirements.txt
 - Test: pytest -q
+- Collect candles: python -m backend.scripts.collect_candles --hours 24
+- Gap check: python -m backend.scripts.check_candles data/collect_binance_M15.csv
+- Price comparison: python -m backend.scripts.compare_prices (then --report)
 - API: uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 - Worker: python -m backend.app.worker (from Phase 6)
 
@@ -35,4 +39,5 @@ Signals only. Full plan: docs/PLAN.md.
 - Phase 0 (repo and environment): done.
 - Phase 1 (indicators): done.
 - Phase 2 (scoring rule, levels, entry zone): done.
-- Next: Phase 3 (price feed). See docs/PLAN.md.
+- Phase 3 (price feed): code done; waiting on the owner's 24 h collection run
+  and 20 MT5 price readings, then choose the source. Do not start Phase 4 unasked.
