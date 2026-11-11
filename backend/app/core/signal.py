@@ -20,12 +20,13 @@ Rows with ``closed == False`` are ignored: signals use closed candles only.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import pandas as pd
 
 from backend.app.core import indicators
+from backend.app.core.candles import timeframe_seconds
 
 RULES_VERSION = 1
 
@@ -224,10 +225,25 @@ def closed_candles(candles: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
+def params_for(timeframe: str, params: SignalParams | None = None) -> SignalParams:
+    """The rule set for candles of another timeframe, for example ``params_for("H1")``.
+
+    Only the candle length changes; it decides the signal and expiry times.
+    """
+    return replace(params or SignalParams(), timeframe_seconds=timeframe_seconds(timeframe))
+
+
 def evaluate(candles: pd.DataFrame, params: SignalParams | None = None) -> SignalResult:
     """Evaluate the rule set on the last closed candle."""
     params = params or SignalParams()
     frame = closed_candles(candles)
+    if "time" in frame.columns and len(frame) >= 2:
+        spacing = frame["time"].diff().dropna()
+        if (spacing != params.timeframe_seconds).all():
+            raise ValueError(
+                f"candles are {int(spacing.min())} s apart but the rule set is for "
+                f"{params.timeframe_seconds} s candles; build it with params_for(timeframe)"
+            )
     candle_time = int(frame["time"].iloc[-1]) if "time" in frame.columns and len(frame) else None
     signal_time = None if candle_time is None else candle_time + params.timeframe_seconds
 

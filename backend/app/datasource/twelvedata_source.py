@@ -87,12 +87,12 @@ class TwelveDataSource(DataSource):
         records = []
         for value in values:
             try:
-                stamp = pd.Timestamp(value["datetime"], tz="UTC")
+                start = int(pd.Timestamp(value["datetime"], tz="UTC").timestamp())
             except (KeyError, TypeError, ValueError):
                 raise DataSourceError(f"Twelve Data /time_series: bad row {str(value)[:200]}") from None
             records.append(
                 {
-                    "time": int(stamp.timestamp()),
+                    "time": start,
                     "open": to_float(value.get("open"), "open"),
                     "high": to_float(value.get("high"), "high"),
                     "low": to_float(value.get("low"), "low"),
@@ -115,4 +115,5 @@ class TwelveDataSource(DataSource):
         price = to_float(data.get("price"), "price")
         if price <= 0:
             raise DataSourceError(f"Twelve Data /price: bad price {price}")
-        return Quote(source=self.name, symbol=self.symbol, time=self._clock(), price=price)
+        # /price carries no time of its own: the quote's age is unknown.
+        return Quote(source=self.name, symbol=self.symbol, time=self._clock(), price=price, timed_by_source=False)

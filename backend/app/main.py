@@ -23,7 +23,7 @@ app = FastAPI(
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
-    """Liveness check. Feed and worker report real states from Phases 3 and 6."""
+    """Liveness check. Feed and worker report real states from Phase 6."""
     settings = get_settings()
     return {
         "status": "ok",

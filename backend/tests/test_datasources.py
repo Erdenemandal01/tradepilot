@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import http.client
 import io
-import math
 from urllib.error import HTTPError, URLError
 
 import pandas as pd
@@ -235,7 +234,7 @@ def test_csv_source_bad_file_raises(tmp_path):
 
 
 def test_make_source_builds_each_source():
-    settings = Settings(_env_file=None, twelvedata_api_key="k")
+    settings = Settings(_env_file=None, price_source="binance", twelvedata_api_key="k")
     assert make_source(settings).name == "binance"
     assert make_source(settings, "twelvedata").name == "twelvedata"
     assert make_source(settings, "csv").name == "csv"
@@ -294,4 +293,108 @@ def test_http_client_does_not_name_the_project():
 def test_quote_spread_is_none_without_bid_and_ask():
     fake = FakeHttp({"/price": {"price": "1"}})
     assert TwelveDataSource("k", get_json=fake).fetch_quote().spread is None
-    assert not math.isnan(BinanceSource(get_json=FakeHttp({"/fapi/v1/ticker/bookTicker": {"bidPrice": "1", "askPrice": "1"}})).fetch_quote().price)
+
+
+def test_binance_quote_without_a_time_is_marked_untimed():
+    fake = FakeHttp({"/fapi/v1/ticker/bookTicker": {"bidPrice": "1", "askPrice": "1"}})
+    quote = BinanceSource(get_json=fake, clock=lambda: 77.0).fetch_quote()
+    assert (quote.time, quote.timed_by_source, quote.spread, quote.price) == (77.0, False, 0.0, 1.0)
+
+
+def test_twelvedata_quote_has_no_time_of_its_own_and_refuses_a_bad_price():
+    good = FakeHttp({"/price": {"price": "4062.50"}})
+    assert TwelveDataSource("k", get_json=good, clock=lambda: 123.0).fetch_quote().timed_by_source is False
+    for bad in ("0", "-1", "abc", None):
+        with pytest.raises(DataSourceError):
+            TwelveDataSource("k", get_json=FakeHttp({"/price": {"price": bad}})).fetch_quote()
+
+
+def test_twelvedata_keeps_volume_when_the_source_sends_one():
+    values = [dict(row, volume="12.5") for row in td_values(3)]
+    fake = FakeHttp({"/time_series": {"values": values, "status": "ok"}})
+    frame = TwelveDataSource("k", get_json=fake).fetch_candles("M15", limit=3)
+    assert frame["volume"].tolist() == [12.5, 12.5, 12.5]
+
+
+def test_csv_source_refuses_ambiguous_times_and_unreadable_flags(tmp_path):
+    for bad_time in ("03.11.2026 07:00:00", "2026-11-11 09:00:00 EET", "yesterday"):
+        bad = write_csv(tmp_path, f"time,open,high,low,close\n{bad_time},1,2,0.5,1.5\n")
+        with pytest.raises(DataSourceError, match="ISO 8601"):
+            CsvSource(bad).fetch_candles("M15")
+    offset = write_csv(tmp_path, "time,open,high,low,close\n2026-11-11T15:00:00+08:00,1,2,0.5,1.5\n")
+    expected = int(pd.Timestamp("2026-11-11 07:00:00", tz="UTC").timestamp())
+    assert CsvSource(offset).fetch_candles("M15")["time"].iloc[0] == expected
+    maybe = write_csv(tmp_path, "time,open,high,low,close,closed\n2026-11-11 07:00:00,1,2,0.5,1.5,maybe\n")
+    with pytest.raises(DataSourceError, match="true or false"):
+        CsvSource(maybe).fetch_candles("M15")
+    forming = write_csv(tmp_path, "time,open,high,low,close,closed\n2026-11-11 07:00:00,1,2,0.5,1.5,false\n")
+    with pytest.raises(DataSourceError, match="no closed candles"):
+        CsvSource(forming).fetch_quote()
+
+
+def test_make_source_passes_the_settings_on(tmp_path):
+    settings = Settings(
+        _env_file=None,
+        price_source="binance",
+        binance_symbol="XAGUSDT",
+        twelvedata_symbol="XAG/USD",
+        twelvedata_api_key="real-key",
+        csv_path=str(tmp_path / "x.csv"),
+        csv_timeframe="H1",
+    )
+    assert make_source(settings).symbol == "XAGUSDT"
+    twelve = make_source(settings, "twelvedata")
+    fake = FakeHttp({"/price": {"price": "30.5"}})
+    twelve._get_json = fake
+    twelve.fetch_quote()
+    assert fake.calls[0][1] == {"symbol": "XAG/USD", "apikey": "real-key"}
+    from_file = make_source(settings, "csv")
+    assert (from_file.path, from_file.timeframe) == (tmp_path / "x.csv", "H1")
+
+
+class Answer:
+    """A stand-in for the object urlopen returns."""
+
+    def __init__(self, body: bytes):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def read(self):
+        return self.body
+
+
+def test_get_json_sends_the_query_and_decodes_the_answer(monkeypatch):
+    seen = {}
+
+    def fake(request, timeout):
+        seen.update(url=request.full_url, agent=request.get_header("User-agent"), timeout=timeout)
+        return Answer(b'{"price": "4062.5"}')
+
+    monkeypatch.setattr(http_mod, "urlopen", fake)
+    answer = http_mod.get_json("https://api.example.test/price", {"symbol": "XAU/USD", "apikey": "k"})
+    assert answer == {"price": "4062.5"}
+    assert seen == {
+        "url": "https://api.example.test/price?symbol=XAU%2FUSD&apikey=k",
+        "agent": http_mod.USER_AGENT,
+        "timeout": 10.0,
+    }
+
+    monkeypatch.setattr(http_mod, "urlopen", lambda request, timeout: Answer(b"<html>busy</html>"))
+    with pytest.raises(DataSourceError, match="not JSON"):
+        http_mod.get_json("https://api.example.test/price", {})
+
+
+@pytest.mark.parametrize("status, headers, retry_after", [(429, {"Retry-After": "120"}, 120.0), (418, {}, None)])
+def test_http_refusal_carries_status_and_retry_after(monkeypatch, status, headers, retry_after):
+    def refuse(request, timeout):
+        raise HTTPError(request.full_url, status, "refused", headers, io.BytesIO(b"{}"))
+
+    monkeypatch.setattr(http_mod, "urlopen", refuse)
+    with pytest.raises(DataSourceError) as info:
+        http_mod.get_json("https://api.example.test/x", {})
+    assert (info.value.status, info.value.retry_after) == (status, retry_after)

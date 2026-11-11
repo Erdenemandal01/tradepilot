@@ -2,8 +2,8 @@
 
 Six independent reviewers read the Phase 3 price-source code, each with a different lens; their findings
 were merged into the 25 below. A second pass was meant to try to refute each finding by reproducing it,
-but it was cut short: only findings 8 and 10 went through it. Treat every other finding as a reviewer's
-claim that still has to be checked before it is acted on. Line numbers refer to commit cae3581.
+but it was cut short: only findings 8 and 10 went through it. The others were then checked by hand, see each
+Status line. Line numbers refer to commit cae3581.
 
 ## 1. Binance: `closed` is decided by the PC clock, so a forming or not-yet-final candle is saved as closed (seen live), and a slow clock fails every fetch after a close
 
@@ -102,7 +102,7 @@ The test that should cover this cannot fail: in test_binance_network_errors_prop
 - Severity claimed: high
 - Where: `backend/scripts/check_candles.py` line 45
 - Verified: no
-- Status: partly addressed 2026-11-11 (failed polls and catch-ups are reported from the log)
+- Status: partly addressed 2026-11-11 (failed polls and catch-ups are reported from the log; a caught-up outage still passes, by design)
 
 check_candles reads only candle open times from the CSV; the verdict (line 45) tests gaps and span. After any outage of up to 39 candles (9.75 h) the collector fills the hole from the exchange's history on its next successful poll (FETCH_LIMIT = 40, collect_candles.py lines 30 and 91) and writes those rows exactly like live ones, with no GAP line. A frozen process cannot log FETCH FAILED either, so the 'done' line says fetch_failures=0. Restarts and FETCH FAILED counts exist only in the .log file, which check_candles never opens. So 'PASS (24 h without a gap)' shows that Binance's history has no hole and that it was reached at least once every 10 hours. It does not show that candles were collected for 24 hours, which is what PLAN section 8 and README step 1 (line 56: 'the computer must not sleep, the internet must not drop') ask for, and what the collector's docstring and the comment at collect_candles.py:89-90 say the check measures ('live collection rather than downloaded history').
 
@@ -129,7 +129,7 @@ Measured from the real start, a clean `--hours 24` run ends at 23.75 to 24.0 h, 
 - Severity claimed: high
 - Where: `backend/app/datasource/binance_source.py` line 9
 - Verified: no
-- Status: open
+- Status: open: the owner's decision before Phase 4 (plan section 10)
 
 The docstring (lines 7-10) and plan 5.2 say the Phase 5 market-hours filter handles the fact that the contract trades while the broker's XAUUSD is closed. That filter only stops a signal from being sent during those hours. The candles stay in every indicator window, and nothing in core/ can remove them: candles.py has no notion of market hours, and find_gaps would report a removed weekend as 196 missing candles.
 
@@ -154,7 +154,7 @@ Smallest code: a pure helper in core/candles.py that drops candles outside a giv
 - Severity claimed: high
 - Where: `backend/scripts/compare_prices.py` line 146
 - Verified: no
-- Status: open
+- Status: checked by hand and fixed 2026-11-11 (each reading is judged against the zone stored with it)
 
 report() takes a single threshold, 0.25 x ATR14 of the feed's M15 candles at the moment --report is run (zone_half_width(), lines 123-134), and pricecheck.summarize (pricecheck.py lines 56-57) holds every stored difference against it. The readings were taken hours or days earlier, each under its own zone. On the real XAUUSDT M15 klines of the last 15.6 days this half width ran from 0.11 to 3.46 USD: about 0.8 to 3.5 between Monday and Friday (1.28 to 3.46 on Thursday 5 Nov alone), median about 1.8 on weekdays and 0.26 at weekends, when Binance keeps trading on roughly a tenth of the volume. So the verdict that decides whether the feed is kept changes with the clock, not with the readings. Context that makes this threshold decisive: the one MT5 reading in PLAN section 10 (4062.08 / 4062.21 at 07:44 UTC) is about 6.6 USD below Binance's 07:44 one-minute bar (4068.57 to 4069.09). If that timestamp is right, the raw check will fail and everything hangs on the 'within zone after offset' line.
 
@@ -253,7 +253,7 @@ Additions to the reviewer's version:
 - Severity claimed: medium
 - Where: `backend/scripts/collect_candles.py` line 85
 - Verified: no
-- Status: open
+- Status: checked by hand and fixed 2026-11-11 (Retry-After is honoured, otherwise the wait doubles up to 15 minutes)
 
 get_json turns every HTTP error into the same DataSourceError and drops the response headers (http.py:29-31); the collector then sleeps 'poll' and tries again whatever the status. Binance's rate-limit rules say a client must back off after a 429, that continuing to send requests leads to an IP ban answered with 418, that bans last from 2 minutes to 3 days and grow for repeat offenders, and its 429 and 418 answers carry Retry-After with the seconds to wait (not triggered live on fapi). The limit is per IP (2400 weight a minute; a live answer showed x-mbx-used-weight-1m: 3), so the collector's own 2 calls a minute cannot cause a 429. Another program or device behind the same public address, or carrier NAT, can, and then this loop adds a violation every 30 s.
 
@@ -266,7 +266,7 @@ get_json turns every HTTP error into the same DataSourceError and drops the resp
 - Severity claimed: medium; after verification: low
 - Where: `backend/scripts/collect_candles.py` line 71
 - Verified: CONFIRMED
-- Status: open
+- Status: fixed 2026-11-11 (a lock file refuses a second collector)
 
 The collector reads the last saved time once at start (line 71) and afterwards trusts its own memory (lines 91 and 114). Nothing stops a second process from using the same default path; each process then appends every new candle. check_candles gives no verdict for such a file: cd.validate raises 'ValueError: candle times must be strictly increasing (oldest first)' at check_candles.py:28 and the script ends with a traceback (exit code 1).
 
@@ -357,7 +357,7 @@ Neither change protects the run in progress, because the old process holds no lo
 - Severity claimed: medium
 - Where: `backend/app/datasource/twelvedata_source.py` line 119
 - Verified: no
-- Status: open
+- Status: checked by hand and fixed 2026-11-11 (Quote.timed_by_source is False when the source gives no time)
 
 `/price` returns only `{"price": ...}`, and fetch_quote() sets Quote.time to the PC clock at fetch (`self._clock()`). `Quote.time` is the only freshness information a consumer gets (base.py:29), so for this source the price's age is always about zero by construction, whatever its real age: offline, a price fetched 30 hours after the last candle comes back with age 0. As far as the reviewer knows from Twelve Data's documentation (it cannot be called here without a key; fairly sure, not certain), `/price` keeps answering with the last price while the market is closed or their feed is stalled. compare_prices writes this time into the reading's time and utc columns.
 
@@ -376,7 +376,7 @@ Separately, line 117 (`if price <= 0`) lets non-finite values through: `{"price"
 - Severity claimed: medium
 - Where: `backend/scripts/compare_prices.py` line 177
 - Verified: no
-- Status: open
+- Status: checked by hand and fixed 2026-11-11 (a file source is refused even as the default; an old quote is not used)
 
 (a) `--source` excludes csv through `choices`, but its default is `settings.price_source`, and argparse does not check a default against `choices` (line 177). With TRADEPILOT_PRICE_SOURCE=csv and no `--source`, `make_source` builds CsvSource and `record()` treats CsvSource.fetch_quote(), the last close in the file, as the feed's current price. Typing `--source csv` explicitly is refused, so the guard exists but the default walks around it.
 
@@ -395,7 +395,7 @@ collect_candles.py:50 has the same default pattern: a misspelt value such as `Bi
 - Severity claimed: medium
 - Where: `backend/scripts/compare_prices.py` line 78
 - Verified: no
-- Status: open
+- Status: checked by hand and fixed 2026-11-11 (the feed is read before and after; slow or moved readings are dropped)
 
 The feed is read once, at the first Enter (line 78). The MT5 numbers are whatever is typed afterwards: nothing measures the time in between and the feed is not read again. Each rejected entry (decimal comma, one number, empty line) asks again inside the inner loop (lines 82-90) and keeps the old quote. An extra Enter after typing the numbers is taken by the next '[n/20] ... press Enter' prompt, which fetches the next quote at once.
 
@@ -408,7 +408,7 @@ The feed is read once, at the first Enter (line 78). The MT5 numbers are whateve
 - Severity claimed: medium
 - Where: `backend/scripts/compare_prices.py` line 58
 - Verified: no
-- Status: open
+- Status: checked by hand and fixed 2026-11-11 (unusual numbers need a yes; 'u' removes the last reading)
 
 parse_broker accepts any two numbers with 0 < bid <= ask (line 58). The typed prices are never compared with the feed price fetched a moment earlier, the row is appended straight away (lines 107-113), and there is no undo. The verdict rests on the largest |difference| and on the mean, so one slip decides it. The slip also lands in 'MT5 spread, avg / max', the figure PLAN section 10 wants for the backtest spread.
 
@@ -421,7 +421,7 @@ parse_broker accepts any two numbers with 0 < bid <= ask (line 58). The typed pr
 - Severity claimed: medium
 - Where: `backend/scripts/compare_prices.py` line 92
 - Verified: no
-- Status: open
+- Status: checked by hand and fixed 2026-11-11 (closed-market and frozen readings need a yes and are left out of the report)
 
 Binance XAUUSDT trades around the clock; the broker's XAUUSD does not. It is shut at the weekend and, judging by the collapse in Binance's own volume, for a daily break at 22:00-23:00 UTC (06:00-07:00 in Ulaanbaatar). While it is closed MT5 keeps showing its last bid and ask. record() checks neither the day and hour nor whether the MT5 numbers moved since the previous reading, and report() uses every row. PLAN section 5.2 already names this hazard for signals (MARKET_CLOSED, 'needed because the Binance contract trades 24/7'); the comparison has no such guard.
 
@@ -434,7 +434,7 @@ Binance XAUUSDT trades around the clock; the broker's XAUUSD does not. It is shu
 - Severity claimed: medium
 - Where: `backend/tests/test_guards.py` line 16
 - Verified: no
-- Status: open
+- Status: checked by hand and fixed 2026-11-11 (scripts are scanned, imports are allow-listed, core is checked for I/O and clocks)
 
 Verified on a scratch copy of backend/ (<scratch>/rev-rules-tests-docs-7c41/guardcopy). Each of these additions still gives 'test_guards.py: 3 passed':
 
@@ -467,7 +467,7 @@ log() prints exception text with print(). Windows socket and OS error messages a
 - Severity claimed: low
 - Where: `backend/scripts/check_candles.py` line 45
 - Verified: no
-- Status: open
+- Status: checked by hand and fixed 2026-11-11 (the latest gap-free run is judged)
 
 `passed = not gaps and span_hours >= args.hours` (check_candles.py:45) asks for the whole file to be free of gaps. The collector resumes any existing file at the default path, however old (collect_candles.py:71; its docstring: 'Safe to stop (Ctrl+C) and restart'). If the file's last candle is more than 39 candles back (an outage longer than about 10 hours, or an earlier try-out run), the new run starts with 'GAP: n candle(s) missing' and that hole stays, so the file can never pass, however long the collector runs afterwards. If the old file is less than 9.75 h old, the time since then is downloaded from history and counted towards the 24 h span. The docstring and the README say only that restarting is safe; neither says the file must be deleted before a new measurement.
 
@@ -493,7 +493,7 @@ cd.validate() raises on the first irregular row and pd.read_csv raises on an emp
 - Severity claimed: low
 - Where: `backend/app/core/candles.py` line 85
 - Verified: no
-- Status: open
+- Status: checked by hand and fixed 2026-11-11 (milliseconds and date-time columns are refused; a coarser timeframe cannot be told apart and is not)
 
 The only checks on `time` are whole numbers, `time % step == 0` (line 85) and strictly increasing (core/candles.py:81-88). A millisecond timestamp of an aligned candle is also a multiple of the step (multiples of 900,000 are multiples of 900), so a frame whose times are in ms passes unchanged. A datetime64 column passes as nanosecond integers (pd.to_numeric converts it). Nothing bounds the value. An H1 file read with timeframe M15 passes too, because every H1 time is M15-aligned. validate is the one place meant to stop a source's own format from reaching the signal engine, and CsvSource sends a numeric `time` column straight to it (csv_source.py:51).
 
@@ -516,7 +516,7 @@ The M15 backtest runs without complaint because scoring is index-based, while ev
 - Severity claimed: low
 - Where: `backend/app/datasource/csv_source.py` line 43
 - Verified: no
-- Status: open
+- Status: checked by hand and fixed 2026-11-11 (ISO 8601 only, errors become DataSourceError)
 
 `pd.to_datetime(raw['time'], utc=True)` runs outside the try blocks and uses pandas' guessing parser. Run on pandas 2.3.3:
 - Text it cannot parse, or two formats in one file, raises a raw ValueError or DateParseError instead of DataSourceError.
@@ -540,7 +540,7 @@ The same raw-exception gap is in twelvedata_source.py line 95: `int(stamp.timest
 - Severity claimed: low
 - Where: `backend/app/core/signal.py` line 74
 - Verified: no
-- Status: open
+- Status: checked by hand and fixed 2026-11-11 (params_for(timeframe); evaluate refuses candles of another spacing)
 
 aggregate itself is correct: its H1 candles from 1,500 real M15 candles equal Binance's own H1 candles in all 375 rows (open, high, low, close and the closed flag), and evaluate scores them the same.
 
@@ -557,7 +557,7 @@ This shows up as soon as the H1 result is stored or displayed (the Phase 5 H1 sc
 - Severity claimed: low
 - Where: `backend/scripts/compare_prices.py` line 71
 - Verified: no
-- Status: open
+- Status: checked by hand and fixed 2026-11-11 (per-source count; a verdict needs 6 different clock hours)
 
 Two separate things. First, record() numbers its prompt from count_rows(out) (lines 63-67 and 71), which counts the rows of every source in the file, while report() counts only the chosen source. Second, report() releases the verdict on the row count alone (lines 163-170). record() asks for the next reading immediately, and nothing checks that the readings are spread over hours, although the module's own docstring says that spread is what makes the picture fair.
 
@@ -570,7 +570,7 @@ Two separate things. First, record() numbers its prompt from count_rows(out) (li
 - Severity claimed: low
 - Where: `backend/tests/test_datasources.py` line 231
 - Verified: no
-- Status: open
+- Status: partly addressed 2026-11-11 (tests grew from 140 to 245 and cover the scripts; no new mutation run was made)
 
 Mutation check on a scratch copy (<scratch>/rev-rules-tests-docs-7c41/mutate.py; the repository was not touched). The suite still reports '140 passed' after each of these changes:
 - http.get_json sends no query string at all, so no symbol, interval, limit or apikey. The two http tests (line 231) only raise from a fake urlopen and never look at a successful request.
@@ -600,7 +600,7 @@ Scripts: the logic that most needs a test is the collector's loop body (collect_
 - Severity claimed: low
 - Where: `backend/scripts/collect_candles.py` line 9
 - Verified: no
-- Status: open
+- Status: checked by hand and fixed 2026-11-11
 
 1. The usage text of all three scripts, which --help prints, says 'py -m backend.scripts...' (collect_candles.py:9-10, check_candles.py:3, compare_prices.py:5 and :14). On this PC 'py' is the global Python 3.11, and 'py -m backend.scripts.collect_candles --help' ends with 'ModuleNotFoundError: No module named pydantic'. It works only in a shell where the venv is activated. README and CLAUDE.md correctly use '.venv/Scripts/python -m ...'; those commands work with --help.
 2. README lines 53-54 say that using Twelve Data needs only the key in .env. The scripts still default to Binance. It also needs '--source twelvedata' on both scripts (or TRADEPILOT_PRICE_SOURCE=twelvedata), and the gap-check file is then data/collect_twelvedata_M15.csv.

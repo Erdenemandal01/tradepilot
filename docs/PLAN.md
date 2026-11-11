@@ -300,20 +300,31 @@ Phase 3 findings so far (2026-11-11):
   only about 11 months of history. That limits Phase 4: check that the last
   30% still holds 100 trades, or take history from another source.
 - Twelve Data needs the owner's free API key; the adapter is tested against
-  recorded response shapes only. Whether XAU/USD is on the free plan is
-  still unknown.
+  assumed response shapes only (nothing was ever recorded from the real
+  service). Whether XAU/USD is on the free plan is still unknown.
+- Feed versus broker, one data point so far: the MT5 reading of 07:44 UTC on
+  2026-11-11 (4062.08 / 4062.21) was about 6.6 USD below Binance's
+  one-minute bar of that minute (4068.57 to 4069.09), while the entry zone's
+  half width that day ran from about 1.3 to 3.5 USD. If the 20 readings
+  confirm a steady offset of that size, the feed needs a fixed offset
+  correction or a spot source; `compare_prices --report` says which.
 - Data terms: Binance and Twelve Data display rights are not yet checked.
 - Dev PC: Windows Smart App Control blocks pandas 3.x DLLs, so
   requirements pin pandas below 3.
 - Code review of 2026-11-11 (docs/reviews/2026-11-11-phase3-review.md): 25
-  findings, most still unverified because the review was cut short. Fixed so
-  far: a candle counts as closed only when the source lists a newer one
-  (Binance can serve a just-closed candle in a pre-close state for a few
-  seconds, and the PC clock can be wrong); transport errors and a locked CSV
-  no longer stop the collector; `check_candles` compares every saved candle
-  with the source. Open and worth deciding before Phase 4: weekend candles
-  of the 24/7 Binance contract reach the indicators as if XAUUSD had traded;
-  the price-comparison verdict depends on when the report is run.
+  findings; each was then checked by hand and 23 are fixed. The main ones: a
+  candle counts as closed only when the source lists a newer one (Binance
+  can serve a just-closed candle in a pre-close state for a few seconds, and
+  the PC clock can be wrong); transport errors, a locked CSV and HTTP 429 no
+  longer stop or endanger the collector; `check_candles` compares every
+  saved candle with the source; `compare_prices` judges each reading against
+  the entry zone of its own moment, drops slow or doubtful readings and
+  needs 20 readings in at least 6 different hours for a verdict.
+- Still open from that review, for the owner to decide before Phase 4:
+  weekend candles of the 24/7 Binance contract reach the indicators as if
+  XAUUSD had traded (about 196 quiet M15 candles per weekend). Blocking
+  signals during closed hours (Phase 5) does not remove them from the EMA,
+  RSI and ATR windows or from the backtest.
 
 Early observation for Phases 4 and 5 (2026-11-11; an ad hoc script on real
 Binance candles made while preparing the UI mock-up, not a backtest): with
@@ -358,6 +369,11 @@ account, no trading API keys.
 - Server: Oracle's free server, or the owner's own computer running 24/7?
   Oracle sign-up may require a card. (Phase 9)
 - Buy a domain name for the site? Needed for HTTPS. (Phase 9)
+- What are MOT Capital's XAUUSD session hours (weekly open and close, the
+  daily break)? Read them from the symbol's specification in MT5. Needed for
+  the market-hours filter and for the price comparison. (Phases 3 and 5)
+- Should candles from hours when the broker's XAUUSD is closed be removed
+  before the indicators and the backtest see them? (Phase 4)
 - Should the signal emails be in Mongolian too, like the site? (Phase 6)
 - Show times in Ulaanbaatar time (UTC+8) on the site and in emails? (Phases 6 and 7)
 

@@ -28,6 +28,8 @@ TIMEFRAME_SECONDS = {
     "D1": 86400,
 }
 
+MAX_TIME = 4_102_444_800  # 2100-01-01: anything later is not seconds (milliseconds, nanoseconds)
+
 CANDLE_COLUMNS = ("time", "open", "high", "low", "close", "volume", "closed")
 PRICE_COLUMNS = ["open", "high", "low", "close"]
 _DTYPES = {
@@ -88,9 +90,13 @@ def validate(candles: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     if frame.empty:
         return frame.astype(_DTYPES)
 
+    if pd.api.types.is_datetime64_any_dtype(frame["time"]):
+        raise ValueError("candle times must be UTC Unix seconds, not a date-time column")
     times = pd.to_numeric(frame["time"]).astype(float)
     if not np.isfinite(times).all() or (times % 1 != 0).any():
         raise ValueError("candle times must be whole UTC Unix seconds")
+    if (times <= 0).any() or (times >= MAX_TIME).any():
+        raise ValueError("candle times are not plausible UTC Unix seconds (milliseconds?)")
     frame["time"] = times.astype("int64")
     if (frame["time"] % step != 0).any():
         raise ValueError(f"candle times must be aligned to {timeframe} boundaries")

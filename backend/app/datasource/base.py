@@ -19,7 +19,16 @@ Clock = Callable[[], float]
 
 
 class DataSourceError(RuntimeError):
-    """The source could not deliver real data (network, limits, bad response)."""
+    """The source could not deliver real data (network, limits, bad response).
+
+    ``status`` is the HTTP status when there was one; ``retry_after`` is the
+    number of seconds the service asked the client to wait (HTTP 429 / 418).
+    """
+
+    def __init__(self, message: str, *, status: int | None = None, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
 
 
 @dataclass(frozen=True)
@@ -30,6 +39,9 @@ class Quote:
     price: float  # mid of bid and ask when both are known, otherwise the last price
     bid: float | None = None
     ask: float | None = None
+    # False when the source gave no time: ``time`` is then only the moment of
+    # the fetch, and the price's real age is unknown (never treat it as fresh).
+    timed_by_source: bool = True
 
     @property
     def spread(self) -> float | None:

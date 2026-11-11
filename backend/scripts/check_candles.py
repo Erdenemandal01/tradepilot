@@ -2,10 +2,12 @@
 
     .venv/Scripts/python -m backend.scripts.check_candles data/collect_binance_M15.csv
 
-Three checks: no candle is missing, the file spans at least --hours, and every
-saved candle equals what the source reports now (a candle saved a moment too
-early would differ). Exit code 0 only when all three hold. Failed polls and
-catch-ups recorded in the collector's log are reported for information.
+Two checks: the latest run without a missing candle is at least --hours long,
+and every saved candle equals what the source reports now (a candle saved a
+moment too early would differ). Exit code 0 only when both hold; while the
+run is still too short the result reads NOT YET. Earlier gaps are listed, and
+failed polls and catch-ups from the collector's log are reported, for
+information.
 """
 
 from __future__ import annotations
@@ -77,6 +79,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"gaps:      {len(gaps)}")
     for gap in gaps:
         print(f"  {gap.missing} missing between {utc(gap.after)} and {utc(gap.before)}")
+    # An old gap must not fail the file for good: the latest gap-free run is what counts.
+    run_start = gaps[-1].before if gaps else first
+    run_hours = (last + step - run_start) / 3600
+    print(f"last run:  {run_hours:.2f} h without a gap, since {utc(run_start)}")
 
     if args.no_verify:
         print("content:   not compared with the source (--no-verify)")
@@ -105,8 +111,13 @@ def main(argv: list[str] | None = None) -> int:
     if outages:
         print(f"log:       {outages}")
 
-    passed = not gaps and span_hours >= args.hours and content_ok
-    print(f"result:    {'PASS' if passed else 'FAIL'} ({args.hours:g} h without a gap, content equal to the source)")
+    passed = run_hours >= args.hours and content_ok
+    if passed:
+        print(f"result:    PASS ({args.hours:g} h without a gap, content equal to the source)")
+    elif content_ok:
+        print(f"result:    NOT YET ({run_hours:.2f} of {args.hours:g} h without a gap so far)")
+    else:
+        print("result:    FAIL (saved candles differ from the source or could not be compared)")
     return 0 if passed else 1
 
 

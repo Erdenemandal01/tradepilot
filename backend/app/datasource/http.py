@@ -32,7 +32,13 @@ def get_json(url: str, params: Mapping[str, str], timeout: float = 10.0) -> Any:
             detail = exc.read()[:200].decode("utf-8", "replace")
         except (OSError, HTTPException):
             detail = ""
-        raise DataSourceError(f"HTTP {exc.code} from {url}: {detail}") from None
+        try:
+            retry_after = float(exc.headers.get("Retry-After"))
+        except (AttributeError, TypeError, ValueError):
+            retry_after = None  # no header, or its date form
+        raise DataSourceError(
+            f"HTTP {exc.code} from {url}: {detail}", status=exc.code, retry_after=retry_after
+        ) from None
     except (URLError, TimeoutError, OSError, HTTPException) as exc:
         # HTTPException covers a connection cut in mid-response (IncompleteRead)
         # and a garbled status line; neither is an OSError.

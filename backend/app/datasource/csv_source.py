@@ -2,7 +2,8 @@
 
 Columns: ``time``, ``open``, ``high``, ``low``, ``close``; optional ``volume``
 and ``closed``. ``time`` is the candle open time, either UTC Unix seconds or
-a date-time text such as ``2026-11-11 07:45:00`` (read as UTC).
+ISO 8601 text such as ``2026-11-11 07:45:00`` (read as UTC unless it carries
+an offset such as ``+08:00``). Other date formats are refused, not guessed.
 
 Higher timeframes are built from the file's timeframe with ``aggregate``.
 The quote is the last closed candle's close, timed at that candle's close:
@@ -40,7 +41,11 @@ class CsvSource(DataSource):
         except (OSError, ValueError) as exc:
             raise DataSourceError(f"cannot read {self.path}: {exc}") from None
         if "time" in raw.columns and not pd.api.types.is_numeric_dtype(raw["time"]):
-            stamps = pd.to_datetime(raw["time"], utc=True)
+            try:
+                # Strict: a guessing parser reads 03.11.2026 as 11 March and drops zone names.
+                stamps = pd.to_datetime(raw["time"], utc=True, format="ISO8601")
+            except (ValueError, TypeError) as exc:
+                raise DataSourceError(f"{self.path}: time must be Unix seconds or ISO 8601 text: {exc}") from None
             raw["time"] = (stamps - pd.Timestamp(0, tz="UTC")) // pd.Timedelta(seconds=1)
         if "closed" in raw.columns and not pd.api.types.is_bool_dtype(raw["closed"]):
             text = raw["closed"].astype(str).str.strip().str.lower()

@@ -193,3 +193,31 @@ def test_find_mismatches_skips_the_forming_reference_candle_and_missing_volume()
 
 def test_find_mismatches_ignores_candles_outside_the_reference():
     assert cd.find_mismatches(m15(8), m15(3, start=T0 + 20 * M15), "M15") == []
+
+
+# --- times that are not seconds, and the hand-off to the signal engine -------
+
+
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        (lambda f: f.assign(time=f["time"] * 1000), "plausible"),  # milliseconds
+        (lambda f: f.assign(time=pd.to_datetime(f["time"], unit="s")), "date-time"),
+        (lambda f: f.assign(time=f["time"] + 0.5), "whole"),
+        (lambda f: f.assign(time=-f["time"]), "plausible"),
+    ],
+)
+def test_validate_rejects_times_that_are_not_unix_seconds(change, message):
+    with pytest.raises(ValueError, match=message):
+        cd.validate(change(m15(3)), "M15")
+
+
+def test_aggregated_h1_candles_evaluate_with_h1_timing():
+    from backend.app.core import signal as sg
+
+    h1 = cd.aggregate(m15(1300), "M15", "H1")
+    assert len(h1) == 325 and h1["closed"].all()
+    result = sg.evaluate(h1, sg.params_for("H1"))
+    assert result.signal_time == result.candle_time + 3600
+    with pytest.raises(ValueError, match="params_for"):
+        sg.evaluate(h1)

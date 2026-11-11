@@ -104,4 +104,5 @@ class BinanceSource(DataSource):
             price=(bid + ask) / 2,
             bid=bid,
             ask=ask,
+            timed_by_source=stamp is not None,
         )

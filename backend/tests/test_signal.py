@@ -284,11 +284,36 @@ def test_timing_fields_follow_the_last_closed_candle():
     assert result.expires_at == last_open + M15 + 2 * M15  # valid for two more candles
 
 
+def hourly_uptrend(bars: int = 400) -> pd.DataFrame:
+    return make_candles(2000 + 0.0005 * np.arange(bars) ** 2, step=3600)
+
+
 def test_timeframe_and_validity_are_configurable():
     params = sg.SignalParams(timeframe_seconds=3600, valid_bars=3)
-    result = sg.evaluate(accelerating_uptrend(), params)
+    result = sg.evaluate(hourly_uptrend(), params)
     assert result.signal_time == result.candle_time + 3600
     assert result.expires_at == result.signal_time + 3 * 3600
+
+
+def test_params_for_sets_the_candle_length_and_keeps_the_rest():
+    base = sg.SignalParams(valid_bars=3, buy_threshold=4)
+    hourly = sg.params_for("H1", base)
+    assert (hourly.timeframe_seconds, hourly.valid_bars, hourly.buy_threshold) == (3600, 3, 4)
+    assert sg.params_for("M15") == sg.SignalParams()
+    with pytest.raises(ValueError):
+        sg.params_for("M7")
+
+
+def test_candles_of_another_timeframe_need_matching_params():
+    # H1 candles scored with the M15 rule set would get M15 signal and expiry
+    # times without anyone noticing, so the mismatch is refused.
+    with pytest.raises(ValueError, match="params_for"):
+        sg.evaluate(hourly_uptrend())
+    result = sg.evaluate(hourly_uptrend(), sg.params_for("H1"))
+    assert result.signal == sg.BUY and result.signal_time == result.candle_time + 3600
+    # M15 candles with a gap in them are still M15 candles.
+    gappy = accelerating_uptrend().drop(index=[50, 51, 52]).reset_index(drop=True)
+    assert sg.evaluate(gappy).signal_time == gappy["time"].iloc[-1] + M15
 
 
 def test_forming_candle_is_ignored():
