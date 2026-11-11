@@ -164,3 +164,32 @@ def test_aggregate_output_feeds_the_signal_engine_shape():
 def test_aggregate_rejects_impossible_timeframes(source, target):
     with pytest.raises(ValueError):
         cd.aggregate(m15(8), source, target)
+
+
+# --- find_mismatches --------------------------------------------------------
+
+
+def test_find_mismatches_is_empty_when_saved_candles_equal_the_reference():
+    assert cd.find_mismatches(m15(4), m15(6, last_open=True), "M15") == []
+
+
+def test_find_mismatches_reports_each_differing_value():
+    reference = m15(6)
+    reference.loc[1, "close"] += 0.01
+    reference.loc[3, "volume"] += 0.5
+    found = cd.find_mismatches(m15(4), reference, "M15")
+    assert [(m.time, m.column) for m in found] == [(T0 + M15, "close"), (T0 + 3 * M15, "volume")]
+    assert found[0].saved == pytest.approx(101.5) and found[0].reference == pytest.approx(101.51)
+
+
+def test_find_mismatches_skips_the_forming_reference_candle_and_missing_volume():
+    reference = m15(4, last_open=True)
+    reference.loc[3, "close"] += 0.3  # still forming at the source: not comparable yet
+    assert cd.find_mismatches(m15(4), reference, "M15") == []
+    # A source without volume cannot contradict a saved volume, and the reverse.
+    assert cd.find_mismatches(m15(4, volume=False), m15(4), "M15") == []
+    assert cd.find_mismatches(m15(4), m15(4, volume=False), "M15") == []
+
+
+def test_find_mismatches_ignores_candles_outside_the_reference():
+    assert cd.find_mismatches(m15(8), m15(3, start=T0 + 20 * M15), "M15") == []

@@ -61,3 +61,10 @@ def to_float(value: Any, what: str) -> float:
         return float(value)
     except (TypeError, ValueError):
         raise DataSourceError(f"bad {what} in response: {value!r}") from None
+
+
+def to_int(value: Any, what: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise DataSourceError(f"bad {what} in response: {value!r}") from None

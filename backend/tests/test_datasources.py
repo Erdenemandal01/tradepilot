@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import io
 import math
 from urllib.error import HTTPError, URLError
@@ -51,7 +52,7 @@ def binance_klines(n: int = 4) -> list:
 
 def test_binance_candles_parse_and_mark_the_forming_candle():
     fake = FakeHttp({"/fapi/v1/klines": binance_klines(4)})
-    # Clock inside the fourth candle: the first three are closed.
+    # The newest row is the forming candle; the three before it are closed.
     source = BinanceSource(get_json=fake, clock=lambda: T0 + 3 * M15 + 100)
     frame = source.fetch_candles("M15", limit=4)
 
@@ -63,10 +64,21 @@ def test_binance_candles_parse_and_mark_the_forming_candle():
     assert params == {"symbol": "XAUUSDT", "interval": "15m", "limit": "4"}
 
 
-def test_binance_candle_is_closed_after_its_last_millisecond():
+@pytest.mark.parametrize("clock_offset", [-3600, 0, 3 * M15 + 100, 4 * M15 + 5, 86400])
+def test_binance_closed_flag_ignores_the_pc_clock(clock_offset):
+    # A candle is closed only when the response lists a newer one. For a few
+    # seconds after a close the exchange can still serve the old candle in a
+    # pre-close state, and a PC clock can be wrong, so neither may promote
+    # the last row or hold back the earlier ones.
+    fake = FakeHttp({"/fapi/v1/klines": binance_klines(4)})
+    source = BinanceSource(get_json=fake, clock=lambda: T0 + clock_offset)
+    assert source.fetch_candles("M15", limit=4)["closed"].tolist() == [True, True, True, False]
+
+
+def test_binance_single_candle_is_still_forming():
     fake = FakeHttp({"/fapi/v1/klines": binance_klines(1)})
-    source = BinanceSource(get_json=fake, clock=lambda: T0 + M15)
-    assert source.fetch_candles("M15", limit=1)["closed"].tolist() == [True]
+    source = BinanceSource(get_json=fake, clock=lambda: T0 + 10 * M15)
+    assert source.fetch_candles("M15", limit=1)["closed"].tolist() == [False]
 
 
 def test_binance_quote_uses_bid_ask_and_exchange_time():
@@ -86,6 +98,7 @@ def test_binance_quote_uses_bid_ask_and_exchange_time():
     [
         {"code": -1121, "msg": "Invalid symbol."},
         [["not", "a", "kline"]],
+        [["soon", "1", "2", "0.5", "1.5", "1", 0]],  # open time is not a number
         [kline(T0, 4000, 3990, 3999, 4001)],  # high below open: fails validation
     ],
 )
@@ -143,6 +156,13 @@ def test_twelvedata_candles_parse_sort_and_mark_forming():
     assert frame.iloc[2]["close"] == 4003
     _, params = fake.calls[0]
     assert params == {"symbol": "XAU/USD", "interval": "15min", "outputsize": "3", "timezone": "UTC", "apikey": "key123"}
+
+
+@pytest.mark.parametrize("now", [T0 - 3600, T0 + 2 * M15 + 5, T0 + 86400])
+def test_twelvedata_closed_flag_ignores_the_pc_clock(now):
+    fake = FakeHttp({"/time_series": {"meta": {}, "values": td_values(3), "status": "ok"}})
+    frame = TwelveDataSource("k", get_json=fake, clock=lambda: now).fetch_candles("M15", limit=3)
+    assert frame["closed"].tolist() == [True, True, False]
 
 
 def test_twelvedata_error_payload_raises_without_the_key():
@@ -244,6 +264,31 @@ def test_http_errors_do_not_leak_query_parameters(monkeypatch):
     with pytest.raises(DataSourceError) as info:
         http_mod.get_json("https://api.example.test/price", {"apikey": "secret-key"})
     assert "429" in str(info.value) and "secret-key" not in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "error", [http.client.IncompleteRead(b"partial"), http.client.BadStatusLine("garbled"), TimeoutError("slow")]
+)
+def test_http_transport_errors_become_datasource_errors(monkeypatch, error):
+    # A connection cut in mid-response is not an OSError; it must still arrive
+    # as DataSourceError so a long-running collector logs it and carries on.
+    class Broken:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def read(self):
+            raise error
+
+    monkeypatch.setattr(http_mod, "urlopen", lambda request, timeout: Broken())
+    with pytest.raises(DataSourceError):
+        http_mod.get_json("https://api.example.test/klines", {})
+
+
+def test_http_client_does_not_name_the_project():
+    assert "tradepilot" not in http_mod.USER_AGENT.lower()
 
 
 def test_quote_spread_is_none_without_bid_and_ask():

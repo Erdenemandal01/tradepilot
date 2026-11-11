@@ -50,6 +50,16 @@ class Gap:
     missing: int  # number of candles missing
 
 
+@dataclass(frozen=True)
+class Mismatch:
+    """One value of a saved candle that differs from the reference."""
+
+    time: int  # open time of the candle
+    column: str
+    saved: float
+    reference: float
+
+
 def timeframe_seconds(timeframe: str) -> int:
     try:
         return TIMEFRAME_SECONDS[timeframe]
@@ -114,6 +124,30 @@ def find_gaps(candles: pd.DataFrame, timeframe: str) -> list[Gap]:
         Gap(after=int(times[i]), before=int(times[i + 1]), missing=int(diffs[i] // step - 1))
         for i in np.nonzero(diffs > step)[0]
     ]
+
+
+def find_mismatches(
+    candles: pd.DataFrame, reference: pd.DataFrame, timeframe: str, tolerance: float = 1e-9
+) -> list[Mismatch]:
+    """Compare saved candles with a reference frame from the same source.
+
+    Only candles present in both frames and closed in the reference are
+    compared. Volume is compared when both sides have one. A candle that was
+    saved before it had settled shows up here as a difference.
+    """
+    saved = validate(candles, timeframe).set_index("time")
+    ref = validate(reference, timeframe)
+    ref = ref[ref["closed"]].set_index("time")
+    found: list[Mismatch] = []
+    for time in saved.index.intersection(ref.index):
+        for column in (*PRICE_COLUMNS, "volume"):
+            a = float(saved.at[time, column])
+            b = float(ref.at[time, column])
+            if np.isnan(a) or np.isnan(b):
+                continue
+            if abs(a - b) > tolerance:
+                found.append(Mismatch(time=int(time), column=column, saved=a, reference=b))
+    return found
 
 
 def aggregate(candles: pd.DataFrame, source_timeframe: str, target_timeframe: str) -> pd.DataFrame:

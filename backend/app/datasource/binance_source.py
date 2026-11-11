@@ -8,6 +8,12 @@ The contract is quoted in USDT and trades 24/7, so its price differs from a
 broker's spot XAUUSD, and it keeps trading while XAUUSD is closed at the
 weekend. The market-hours filter (Phase 5) handles the second point; the
 price comparison script measures the first.
+
+A candle is reported closed only when the same response lists a newer one.
+The PC clock is not used for this: for a few seconds after a close Binance
+can still serve the candle in a pre-close state, and a clock that runs ahead
+would pass off a forming candle as closed. The price of this rule is a short
+delay: a candle is picked up on the first poll after the next one appears.
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ from backend.app.datasource.base import (
     Quote,
     check_limit,
     to_float,
+    to_int,
 )
 
 BASE_URL = "https://fapi.binance.com"
@@ -58,21 +65,21 @@ class BinanceSource(DataSource):
         )
         if not isinstance(rows, list):
             raise DataSourceError(f"Binance klines: unexpected response {str(rows)[:200]}")
-        now_ms = self._clock() * 1000
         records = []
-        for row in rows:
-            if not isinstance(row, list) or len(row) < 7:
+        newest = len(rows) - 1
+        for index, row in enumerate(rows):
+            if not isinstance(row, list) or len(row) < 6:
                 raise DataSourceError(f"Binance klines: bad row {str(row)[:200]}")
             records.append(
                 {
-                    "time": int(row[0]) // 1000,
+                    "time": to_int(row[0], "open time") // 1000,
                     "open": to_float(row[1], "open"),
                     "high": to_float(row[2], "high"),
                     "low": to_float(row[3], "low"),
                     "close": to_float(row[4], "close"),
                     "volume": to_float(row[5], "volume"),
-                    # row[6] is the last millisecond of the candle.
-                    "closed": int(row[6]) < now_ms,
+                    # Closed only when the response lists a newer candle.
+                    "closed": index < newest,
                 }
             )
         try:
@@ -89,7 +96,7 @@ class BinanceSource(DataSource):
         if not 0 < bid <= ask:
             raise DataSourceError(f"Binance bookTicker: bad bid/ask {bid}/{ask}")
         stamp = data.get("time")
-        quote_time = int(stamp) / 1000 if stamp is not None else self._clock()
+        quote_time = to_int(stamp, "time") / 1000 if stamp is not None else self._clock()
         return Quote(
             source=self.name,
             symbol=self.symbol,

@@ -84,28 +84,27 @@ class TwelveDataSource(DataSource):
         values = data.get("values")
         if not isinstance(values, list):
             raise DataSourceError(f"Twelve Data /time_series: no values in {str(data)[:200]}")
-        step = cd.timeframe_seconds(timeframe)
-        now = self._clock()
         records = []
         for value in values:
             try:
                 stamp = pd.Timestamp(value["datetime"], tz="UTC")
             except (KeyError, TypeError, ValueError):
                 raise DataSourceError(f"Twelve Data /time_series: bad row {str(value)[:200]}") from None
-            start = int(stamp.timestamp())
             records.append(
                 {
-                    "time": start,
+                    "time": int(stamp.timestamp()),
                     "open": to_float(value.get("open"), "open"),
                     "high": to_float(value.get("high"), "high"),
                     "low": to_float(value.get("low"), "low"),
                     "close": to_float(value.get("close"), "close"),
                     "volume": to_float(value["volume"], "volume") if "volume" in value else np.nan,
-                    "closed": start + step <= now,
                 }
             )
         frame = pd.DataFrame(records, columns=list(cd.CANDLE_COLUMNS))
         frame = frame.sort_values("time", kind="stable").reset_index(drop=True)
+        # Closed only when the response lists a newer candle; the PC clock is
+        # not used (see binance_source.py for why).
+        frame["closed"] = np.arange(len(frame)) < len(frame) - 1
         try:
             return cd.validate(frame, timeframe)
         except ValueError as exc:
