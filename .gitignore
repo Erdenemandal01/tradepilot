@@ -1,0 +1,19 @@
+# Secrets and local settings
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local data: candles, SQLite, backtest reports
+data/*
+!data/.gitkeep
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
