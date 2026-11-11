@@ -374,6 +374,9 @@ account, no trading API keys.
   the market-hours filter and for the price comparison. (Phases 3 and 5)
 - Should candles from hours when the broker's XAUUSD is closed be removed
   before the indicators and the backtest see them? (Phase 4)
+- When does a tracked signal end without reaching TP or SL (the "expired"
+  outcome of section 6)? Until that is decided the log shows such a signal
+  as "no outcome yet". (Phase 6)
 - Should the signal emails be in Mongolian too, like the site? (Phase 6)
 - Show times in Ulaanbaatar time (UTC+8) on the site and in emails? (Phases 6 and 7)
 
@@ -408,9 +411,12 @@ desktop page, the phone layout and the other states of the signal card):
 - Left rail: icon links to the sections. On a phone it becomes a row.
 - Signal card, first in reading order and first on a phone: side, a
   valid-for countdown with a bar, grade and status chips, the entry zone
-  with the reference price and whether the current price is inside it, SL
-  and TP with their distances from the fill price, a three-step "if you
-  enter" note, the not-advice line.
+  (labelled as feed prices) and whether the current price is inside it, SL
+  and TP as distances from the fill price in large figures with the feed's
+  levels small beside them, a three-step "if you enter" note, the
+  not-advice line. The distances lead because the feed and the broker can
+  differ by several USD; if Phase 3 ends with a feed that tracks the broker
+  closely, the price levels can lead again.
 - KPI tiles: price and its source, signals today, the next high-impact
   event, the rule status ("experimental" until the backtest gate is passed).
 - Chart card (M15 / H1 switch): candles, BUY / SELL markers, the entry zone

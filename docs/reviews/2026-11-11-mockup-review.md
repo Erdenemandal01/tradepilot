@@ -2,8 +2,29 @@
 
 Five reviewers were started on the mock-up of the web dashboard (plan section 11); two finished before the
 review was cut short: the Mongolian copy and usability. The format, layout / accessibility and content
-lenses did not finish. Nothing below has been applied to the mock-up yet. Line numbers refer to the
-mock-up's desktop artboard as first published.
+lenses did not finish. Line numbers refer to the mock-up's desktop artboard as first published.
+
+## What was applied (2026-11-11, the canvas's fifth version)
+
+Each finding was judged by hand first. The result has not been seen rendered.
+
+Mongolian copy: all 18 applied, with two deviations. Finding 5: the pill «Нээлттэй» was renamed to
+«Үр дүн гараагүй», as the usability review asks, instead of being kept and explained; the pill «Хугацаа
+дууссан» was removed because no rule stands behind it yet. Finding 12: step 1 follows the usability
+review's wording, because checking the zone against MT5 is the very thing that goes wrong.
+
+Usability:
+1. Applied in full: the zone is labelled as Binance prices, step 1 says to read the zone status on this
+   page, and the SL / TP boxes lead with the distance from the fill price and show the feed's level small.
+   The optional price input was not added: it is new material and the owner's call.
+2. Applied: on a phone the icon rail now falls below the page and the alerts card comes before the empty
+   statistics; the reference price line was removed from the signal card.
+3. Applied: the chip «Дараалсан 5 дахь BUY», the status words and the explained legend. The open question
+   it raises is in plan section 10.
+4. Applied: a fourth card, "price has left the zone", and «Сигнал алга» instead of HOLD.
+5. Applied: the outcome is now the third column of the log; the price column is «Жишиг үнэ».
+6. Partly: the statistics pill reads «Backtest хийгдээгүй», and the fourth KPI tile is quieter. The
+   proposed "difference from MT5" tile was not added: it is a new data item and needs the owner's yes.
 
 ## Mongolian copy
 
