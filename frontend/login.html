@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="mn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0B1220">
+<meta name="robots" content="noindex, nofollow">
+<title>Нэвтрэх · TradePilot AI</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/styles.css">
+<script src="/static/login.js" defer></script>
+</head>
+<body>
+<main class="login-page">
+<div class="card login-card">
+
+<div class="brand">
+<div class="brand-mark">
+<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true" focusable="false"><path d="M6 4v3"></path><path d="M6 15v5"></path><rect x="4" y="7" width="4" height="8" rx="1"></rect><path d="M12 2v6"></path><path d="M12 16v6"></path><rect x="10" y="8" width="4" height="8" rx="1" fill="currentColor"></rect><path d="M18 5v4"></path><path d="M18 14v5"></path><rect x="16" y="9" width="4" height="5" rx="1"></rect></svg>
+</div>
+<div class="brand-text">
+<div class="brand-name">TradePilot AI</div>
+<div class="brand-sub">XAUUSD · сигналын самбар</div>
+</div>
+</div>
+
+<h1 class="login-title">Нэвтрэх</h1>
+
+<form id="login-form" class="login-form" method="post" action="/api/login" novalidate>
+<div class="field">
+<label for="password">Нууц үг</label>
+<input id="password" class="input" name="password" type="password" autocomplete="current-password" autocapitalize="off" spellcheck="false" required autofocus aria-describedby="login-msg">
+</div>
+<button type="submit" id="login-btn" class="btn btn-primary">Нэвтрэх</button>
+<div id="login-msg" class="msg" role="alert" hidden></div>
+<noscript>
+<div class="msg">Нэвтрэхийн тулд хөтөч дээр JavaScript асаалттай байх шаардлагатай.</div>
+</noscript>
+</form>
+
+<p class="login-foot">Сигнал нь санхүүгийн зөвлөгөө биш. Систем захиалга илгээдэггүй, арилжааг та MT5 дээр өөрөө хийнэ.</p>
+
+</div>
+</main>
+</body>
+</html>

@@ -8,15 +8,18 @@ from backend.app.main import app
 client = TestClient(app)
 
 
-def test_health_reports_ok_before_feed_and_worker_exist():
+def test_health_is_public_and_reports_a_feed_that_has_not_started():
+    # Without the app's lifespan the live feed thread is not running.
     response = client.get("/api/health")
     assert response.status_code == 200
     assert response.json() == {
         "status": "ok",
         "version": __version__,
         "symbol": "XAUUSD",
-        "feed": "not_configured",
+        "feed": "not_started",
         "worker": "not_running",
+        "source": "binance",
+        "last_candle_age": None,
     }
 
 

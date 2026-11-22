@@ -20,13 +20,26 @@ import pandas as pd
 
 TIMEFRAME_SECONDS = {
     "M1": 60,
+    "M2": 120,
+    "M3": 180,
     "M5": 300,
+    "M10": 600,
     "M15": 900,
     "M30": 1800,
+    "M45": 2700,
     "H1": 3600,
+    "H2": 7200,
+    "H3": 10800,
     "H4": 14400,
     "D1": 86400,
+    "W1": 604800,
 }
+# Candles that follow the calendar and so have no fixed length: 1, 3, 6 and 12
+# months, opening on the first day of a month, a quarter, a half-year, a year.
+MONTH_TIMEFRAMES = {"MN1": 1, "MN3": 3, "MN6": 6, "MN12": 12}
+# Every candle length a chart can ask for, shortest first.
+CHART_TIMEFRAMES = (*TIMEFRAME_SECONDS, *MONTH_TIMEFRAMES)
+WEEK_OFFSET = 4 * 86400  # weeks open on Monday 00:00 UTC; second 0 was a Thursday
 
 MAX_TIME = 4_102_444_800  # 2100-01-01: anything later is not seconds (milliseconds, nanoseconds)
 
@@ -63,11 +76,50 @@ class Mismatch:
 
 
 def timeframe_seconds(timeframe: str) -> int:
+    if timeframe in MONTH_TIMEFRAMES:
+        raise ValueError(f"timeframe {timeframe!r} has no fixed length: it follows the calendar")
     try:
         return TIMEFRAME_SECONDS[timeframe]
     except KeyError:
-        known = ", ".join(TIMEFRAME_SECONDS)
+        known = ", ".join(CHART_TIMEFRAMES)
         raise ValueError(f"unknown timeframe {timeframe!r}; known: {known}") from None
+
+
+def _month_index(times: pd.Series) -> pd.Series:
+    """Months counted from year 0, so that adding and dividing them is plain arithmetic."""
+    stamps = pd.to_datetime(times.astype("int64"), unit="s")
+    return stamps.dt.year * 12 + stamps.dt.month - 1
+
+
+def _month_open(index: pd.Series) -> pd.Series:
+    """UTC Unix seconds of the first day of each counted month."""
+    parts = pd.DataFrame({"year": index // 12, "month": index % 12 + 1, "day": 1})
+    stamps = pd.to_datetime(parts)
+    return ((stamps - pd.Timestamp(0)) // pd.Timedelta(seconds=1)).astype("int64")
+
+
+def opens(times: pd.Series, timeframe: str) -> pd.Series:
+    """Open time of the ``timeframe`` candle each time falls in.
+
+    All boundaries are UTC. Fixed lengths count from midnight, weeks from
+    Monday, and the month timeframes from the first day of a calendar month,
+    quarter, half-year or year.
+    """
+    times = pd.Series(times).astype("int64")
+    if timeframe in MONTH_TIMEFRAMES:
+        size = MONTH_TIMEFRAMES[timeframe]
+        return _month_open(_month_index(times) // size * size)
+    step = timeframe_seconds(timeframe)
+    offset = WEEK_OFFSET if timeframe == "W1" else 0
+    return (times - offset) // step * step + offset
+
+
+def following(times: pd.Series, timeframe: str) -> pd.Series:
+    """Open time of the candle after the one that opens at each time."""
+    times = pd.Series(times).astype("int64")
+    if timeframe in MONTH_TIMEFRAMES:
+        return _month_open(_month_index(times) + MONTH_TIMEFRAMES[timeframe])
+    return times + timeframe_seconds(timeframe)
 
 
 def validate(candles: pd.DataFrame, timeframe: str) -> pd.DataFrame:
@@ -76,7 +128,8 @@ def validate(candles: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     Raises ValueError when a rule is broken. Adds ``volume`` (NaN) and
     ``closed`` (True) when they are absent. Never modifies the input.
     """
-    step = timeframe_seconds(timeframe)
+    if timeframe not in MONTH_TIMEFRAMES:
+        timeframe_seconds(timeframe)  # an unknown timeframe is refused before anything else
     missing = [c for c in ("time", *PRICE_COLUMNS) if c not in candles.columns]
     if missing:
         raise ValueError(f"candles are missing columns: {', '.join(missing)}")
@@ -98,7 +151,7 @@ def validate(candles: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     if (times <= 0).any() or (times >= MAX_TIME).any():
         raise ValueError("candle times are not plausible UTC Unix seconds (milliseconds?)")
     frame["time"] = times.astype("int64")
-    if (frame["time"] % step != 0).any():
+    if (opens(frame["time"], timeframe) != frame["time"]).any():
         raise ValueError(f"candle times must be aligned to {timeframe} boundaries")
     if not frame["time"].is_monotonic_increasing or frame["time"].duplicated().any():
         raise ValueError("candle times must be strictly increasing (oldest first)")
@@ -192,3 +245,141 @@ def aggregate(candles: pd.DataFrame, source_timeframe: str, target_timeframe: st
     out["closed"] = complete[complete | is_last]
     out["time"] = out.index.astype("int64")
     return validate(out.reset_index(drop=True), target_timeframe)
+
+
+def count_breaks(candles: pd.DataFrame, timeframe: str) -> int:
+    """How many times a candle is not followed by the next one of its timeframe."""
+    times = candles["time"].reset_index(drop=True)
+    if len(times) < 2:
+        return 0
+    expected = following(times.iloc[:-1], timeframe).to_numpy()
+    return int((times.iloc[1:].to_numpy() != expected).sum())
+
+
+def can_resample(source_timeframe: str, target_timeframe: str) -> bool:
+    """Whether whole ``source`` candles fill every ``target`` candle exactly."""
+    known = (*TIMEFRAME_SECONDS, *MONTH_TIMEFRAMES)
+    if source_timeframe not in known or target_timeframe not in known:
+        return False
+    source_months = MONTH_TIMEFRAMES.get(source_timeframe)
+    target_months = MONTH_TIMEFRAMES.get(target_timeframe)
+    if source_months is not None:
+        return target_months is not None and target_months > source_months and target_months % source_months == 0
+    source = TIMEFRAME_SECONDS[source_timeframe]
+    if source_timeframe == "W1" or 86400 % source:
+        return False  # weeks fit neither months nor anything else here
+    if target_months is not None:
+        return True
+    target = TIMEFRAME_SECONDS[target_timeframe]
+    return target > source and target % source == 0
+
+
+def resample(
+    candles: pd.DataFrame, source_timeframe: str, target_timeframe: str, *, history_starts: bool = False
+) -> tuple[pd.DataFrame, bool]:
+    """Longer candles for a chart, for example M45 from M15 or MN12 from MN1.
+
+    Each candle takes the first open, the highest high, the lowest low, the
+    last close and the summed volume of the candles inside its boundaries
+    (see ``opens``). A candle is never built over a hole: a bucket with a
+    part missing is left out, and the hole then shows as a break
+    (``count_breaks``). Two incomplete buckets are kept because they are
+    real: the newest one, as still forming, and the oldest one when
+    ``history_starts`` says the source has nothing older than the first
+    candle given. The second return value tells whether the first candle is
+    such a partial one.
+    """
+    if not can_resample(source_timeframe, target_timeframe):
+        raise ValueError(f"cannot build {target_timeframe} candles from {source_timeframe}")
+    source_months = MONTH_TIMEFRAMES.get(source_timeframe)
+    target_months = MONTH_TIMEFRAMES.get(target_timeframe)
+    source = 0 if source_months is not None else timeframe_seconds(source_timeframe)
+
+    frame = validate(candles, source_timeframe)
+    if frame.empty:
+        return validate(frame, target_timeframe), False
+
+    bucket = opens(frame["time"], target_timeframe)
+    if source_months is not None:
+        position = (_month_index(frame["time"]) - _month_index(bucket)) // source_months
+    else:
+        position = (frame["time"] - bucket) // source
+    grouped = frame.assign(bucket=bucket.to_numpy(), position=position.to_numpy()).groupby("bucket", sort=True)
+    out = pd.DataFrame(
+        {
+            "open": grouped["open"].first(),
+            "high": grouped["high"].max(),
+            "low": grouped["low"].min(),
+            "close": grouped["close"].last(),
+            "volume": grouped["volume"].sum(min_count=1),
+            "count": grouped["time"].size(),
+            "first": grouped["position"].min(),
+            "last": grouped["position"].max(),
+            "all_closed": grouped["closed"].all(),
+        }
+    )
+    starts = pd.Series(out.index.to_numpy(), index=out.index)
+    if source_months is not None:
+        parts = target_months // source_months
+    else:
+        parts = (following(starts, target_timeframe) - starts) // source  # a month has 28 to 31 days
+
+    unbroken = out["count"] == out["last"] - out["first"] + 1
+    from_open = out["first"] == 0
+    to_close = out["last"] == parts - 1
+    full = unbroken & from_open & to_close & out["all_closed"]
+    newest = pd.Series(out.index == out.index[-1], index=out.index)
+    keep = full | (newest & unbroken & from_open)
+    closed = full.copy()
+    partial = False
+    if history_starts and not keep.iloc[0] and unbroken.iloc[0] and (to_close.iloc[0] or newest.iloc[0]):
+        # The oldest bucket lacks its beginning because the history begins there.
+        keep.iloc[0] = True
+        closed.iloc[0] = not newest.iloc[0]
+        partial = True
+
+    out = out[keep]
+    built = pd.DataFrame(
+        {
+            "time": out.index.to_numpy().astype("int64"),
+            "open": out["open"].to_numpy(),
+            "high": out["high"].to_numpy(),
+            "low": out["low"].to_numpy(),
+            "close": out["close"].to_numpy(),
+            "volume": out["volume"].to_numpy(),
+            "closed": closed[keep].to_numpy().astype(bool),
+        }
+    )
+    return validate(built, target_timeframe), partial
+
+
+def merge(stored: pd.DataFrame, fresh: pd.DataFrame, timeframe: str, keep: int | None = None) -> pd.DataFrame | None:
+    """Stored candles with a newer ``fresh`` tail from the same source laid over them.
+
+    Fresh rows replace stored rows from their first time on, so a candle that
+    was still forming gets its final values. Returns None when the tail does
+    not connect: candles are missing between the two, the stored forming
+    candle would stay unfinished in the middle, or the source went back in
+    time. The caller then reloads the whole history instead of guessing.
+    ``keep`` limits the result to the newest rows.
+    """
+    step = timeframe_seconds(timeframe)
+    if fresh.empty:
+        merged = stored
+    elif stored.empty:
+        merged = fresh
+    else:
+        first = int(fresh["time"].iloc[0])
+        last = int(stored["time"].iloc[-1])
+        covered = last if bool(stored["closed"].iloc[-1]) else last - step
+        if first > covered + step or int(fresh["time"].iloc[-1]) < last:
+            return None
+        merged = pd.concat([stored[stored["time"] < first], fresh], ignore_index=True)
+    merged = validate(merged, timeframe)
+    # A hole the stored candles already had is the source's own history: loading
+    # everything again would bring the same hole back. Only a hole that was not
+    # there before means candles were missed.
+    known = set() if stored.empty else {(gap.after, gap.before) for gap in find_gaps(stored, timeframe)}
+    if any((gap.after, gap.before) not in known for gap in find_gaps(merged, timeframe)):
+        return None
+    return merged.iloc[-keep:].reset_index(drop=True) if keep else merged

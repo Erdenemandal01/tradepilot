@@ -31,6 +31,29 @@ class Settings(BaseSettings):
     csv_path: str = "data/xauusd_m15.csv"
     csv_timeframe: str = "M15"
 
+    # Live feed (the web app's own loop): how often the source is asked, how
+    # many candles are kept in memory, and when a silent feed is emailed about.
+    live_enabled: bool = True
+    poll_seconds: float = 2.0
+    history_candles: int = 1500
+    alert_after_seconds: int = 300
+    # Times in emails are shown in this zone (UTC+8 is Ulaanbaatar).
+    display_utc_offset_hours: int = 8
+
+    # Login. Both are written by `python -m backend.scripts.set_password`.
+    password_hash: SecretStr = SecretStr("")
+    session_secret: SecretStr = SecretStr("")
+    session_hours: int = 12
+    cookie_secure: bool = False  # set true once the site is served over HTTPS
+
+    # Email (SMTP). Empty host or recipients: no email is sent.
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: SecretStr = SecretStr("")
+    email_from: str = ""
+    email_to: str = ""  # comma-separated addresses
+
 
 @lru_cache
 def get_settings() -> Settings:

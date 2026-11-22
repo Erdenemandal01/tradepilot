@@ -59,6 +59,10 @@ SMTP settings.
 One worker process computes a signal each time a candle closes, stores it and
 sends it. The web app only shows stored results.
 
+Interim (since 2026-11-22, until Phase 6): the web process runs the live loop
+itself (`backend/app/live.py`) and keeps candles and decisions in memory. See
+`docs/WEB.md`.
+
 ```
 price sources (Binance XAUUSDT, Twelve Data, CSV)     news sources (calendar, RSS)
                 |                                                |
@@ -101,7 +105,9 @@ tradepilot/
 ├─ docker-compose.yml          # Phase 9
 ├─ backend/
 │  ├─ app/
-│  │  ├─ main.py               # FastAPI: API, login, static files
+│  │  ├─ main.py               # FastAPI: API, login, static files, live stream
+│  │  ├─ live.py               # live feed loop (in memory until Phase 6)
+│  │  ├─ auth.py               # password hash, session cookie, login throttle
 │  │  ├─ worker.py             # 24/7 loop: candle -> signal -> notification
 │  │  ├─ config.py             # .env settings
 │  │  ├─ store.py              # SQLite
@@ -125,7 +131,7 @@ tradepilot/
 │  │     └─ digest.py          # AI digest
 │  ├─ scripts/                 # candle collector, gap check, price comparison; history download, backtest runner
 │  └─ tests/
-├─ frontend/
+├─ frontend/                   # index.html, login.html, static/ (CSS, JS, vendored chart library)
 └─ data/                       # SQLite, CSV; not in git
 ```
 
@@ -263,6 +269,9 @@ Everything except `/api/health` requires login. All times are UTC Unix seconds.
 | GET | `/api/news` | Upcoming events, latest AI digest |
 | GET | `/api/stats` | Backtest and live metrics, by grade |
 
+The live page also uses `GET /api/state` (one snapshot) and `GET /api/stream`
+(server-sent events, one tick per feed cycle); shapes are in `docs/WEB.md`.
+
 Two kinds of email are sent: signals and system alerts. An alert goes out
 when no price has arrived for 5 minutes or the worker has restarted. A signal
 is valid for only 30 minutes, so the email states the expiry time. No signal
@@ -292,6 +301,17 @@ Status: Phases 0, 1 and 2 are done. Phase 3 code is done (2026-11-11); its
 acceptance checks wait on the owner: a 24-hour collection run
 (`collect_candles` then `check_candles`) and 20 MT5 readings
 (`compare_prices`, then `--report`). Then a source is chosen.
+
+Web brought forward (2026-11-22, the owner's request: "go straight to the web;
+get the data without delay, process it well, notify me"). Built: login, the
+Mongolian dashboard of section 11, a live feed that asks the source every 2
+seconds and pushes to the page, the H1, duplicate, stale-feed and market-hours
+filters (`core/filters.py`; market hours by a rule of thumb until the broker's
+hours are known), browser notifications and email through SMTP when it is
+configured. Not built: the news window, storage, the separate worker, outcome
+tracking beyond what the candles in memory show, backtest, AI digest. Signals
+are untested and labelled experimental. Phase 3's acceptance checks are still
+open (the collector stopped after 5.25 hours on 2026-11-11; no MT5 readings).
 
 Phase 3 findings so far (2026-11-11):
 - Binance XAUUSDT answers keyless from the owner's network (Mongolia):
@@ -378,7 +398,11 @@ account, no trading API keys.
   outcome of section 6)? Until that is decided the log shows such a signal
   as "no outcome yet". (Phase 6)
 - Should the signal emails be in Mongolian too, like the site? (Phase 6)
+  Built in Mongolian for now; say if English is wanted.
 - Show times in Ulaanbaatar time (UTC+8) on the site and in emails? (Phases 6 and 7)
+  Built that way for now (`TRADEPILOT_DISPLAY_UTC_OFFSET_HOURS`).
+- Should every signal of a run be announced, or only the first? A trend now
+  gives a notification every 30 minutes.
 
 ## 11. Web UI direction (Phase 7)
 

@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="mn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0B1220">
+<meta name="robots" content="noindex, nofollow">
+<meta name="format-detection" content="telephone=no">
+<title>TradePilot AI · XAUUSD сигналын самбар</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/styles.css">
+<script src="/static/vendor/lightweight-charts.standalone.production.js" defer></script>
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Гол агуулга руу очих</a>
+
+<div class="page">
+
+<header class="card topbar">
+<div class="brand">
+<div class="brand-mark">
+<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true" focusable="false"><path d="M6 4v3"></path><path d="M6 15v5"></path><rect x="4" y="7" width="4" height="8" rx="1"></rect><path d="M12 2v6"></path><path d="M12 16v6"></path><rect x="10" y="8" width="4" height="8" rx="1" fill="currentColor"></rect><path d="M18 5v4"></path><path d="M18 14v5"></path><rect x="16" y="9" width="4" height="5" rx="1"></rect></svg>
+</div>
+<div class="brand-text">
+<h1 class="brand-name">TradePilot AI</h1>
+<div class="brand-sub">XAUUSD · сигналын самбар</div>
+</div>
+</div>
+<div class="topbar-right">
+<div id="status-pill" class="status-pill is-starting">
+<span class="shape" aria-hidden="true"></span>
+<span id="status-text">Ачаалж байна</span>
+</div>
+<div class="clock">
+<time id="clock" class="clock-time">—</time>
+<span id="clock-zone" class="clock-zone">Улаанбаатар</span>
+</div>
+<div class="topbar-actions">
+<button type="button" id="notify-btn" class="btn btn-grow btn-wide" aria-pressed="false">
+<span id="notify-icon" class="btn-glyph" aria-hidden="true"></span>
+<span id="notify-text">Мэдэгдэл асаах</span>
+</button>
+<button type="button" id="sound-btn" class="btn btn-icon" aria-pressed="true" aria-label="Дуут дохио" title="Дуут дохио">
+<span id="sound-icon" class="btn-glyph" aria-hidden="true"></span>
+</button>
+<button type="button" id="logout-btn" class="btn btn-grow">Системээс гарах</button>
+</div>
+</div>
+</header>
+
+<div class="shell">
+
+<nav class="card rail" aria-label="Хэсгүүд">
+<div class="rail-list">
+<a class="rail-link" href="#signal" data-spy="signal" aria-label="Одоогийн сигнал" title="Одоогийн сигнал" aria-current="true">
+<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M13 2L4 14h7l-1 8 9-12h-7l1-8z"></path></svg>
+</a>
+<a class="rail-link" href="#chart" data-spy="chart" aria-label="График" title="График">
+<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M7 3v4"></path><path d="M7 17v4"></path><rect x="5" y="7" width="4" height="10" rx="1"></rect><path d="M17 2v4"></path><path d="M17 13v6"></path><rect x="15" y="6" width="4" height="7" rx="1"></rect></svg>
+</a>
+<a class="rail-link" href="#log" data-spy="log" aria-label="Сигналын түүх" title="Сигналын түүх">
+<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M8 6h12"></path><path d="M8 12h12"></path><path d="M8 18h12"></path><path d="M4 6h.01"></path><path d="M4 12h.01"></path><path d="M4 18h.01"></path></svg>
+</a>
+<a class="rail-link" href="#news" data-spy="news" aria-label="Мэдээ" title="Мэдээ">
+<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M3 10h18"></path><path d="M8 3v4"></path><path d="M16 3v4"></path></svg>
+</a>
+<a class="rail-link" href="#stats" data-spy="stats" aria-label="Статистик" title="Статистик">
+<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M5 20V10"></path><path d="M12 20V4"></path><path d="M19 20v-7"></path></svg>
+</a>
+</div>
+</nav>
+
+<main id="main" class="main" tabindex="-1">
+
+<noscript>
+<div class="card panel">Энэ самбар ажиллахын тулд хөтөч дээр JavaScript асаалттай байх шаардлагатай.</div>
+</noscript>
+
+<div class="hero">
+
+<section id="signal" class="card signal-card" aria-labelledby="signal-title">
+<div class="card-head">
+<h2 id="signal-title" class="label">Одоогийн сигнал</h2>
+<div id="signal-chip" class="head-chip"></div>
+</div>
+<div id="signal-notes" class="signal-notes" hidden></div>
+<div id="signal-body" class="signal-body">
+<div class="side-row">
+<div class="side-icon" aria-hidden="true">
+<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" focusable="false"><path d="M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18z"></path><path d="M12 7v5l3 2"></path></svg>
+</div>
+<div class="side-text">
+<div class="side-title tone-muted">Ачаалж байна</div>
+<div class="side-sub">Серверээс мэдээлэл авч байна.</div>
+</div>
+</div>
+</div>
+</section>
+
+<div class="hero-side">
+
+<section class="tiles" aria-label="Гол үзүүлэлтүүд">
+<div id="price-tile" class="card tile">
+<h3 class="tile-label">XAUUSD ханш</h3>
+<div id="price-value" class="tile-value">—</div>
+<div id="price-source" class="tile-sub">—</div>
+<div id="price-quote" class="tile-sub tile-quote" hidden><span id="price-bid"></span><span id="price-ask"></span></div>
+<div id="price-flag" class="flag" hidden></div>
+</div>
+<div class="card tile">
+<h3 class="tile-label">Өнөөдрийн сигнал</h3>
+<div id="today-total" class="tile-value">—</div>
+<div id="today-split" class="tile-sub">—</div>
+</div>
+<div class="card tile">
+<h3 class="tile-label">Дараагийн мэдээ</h3>
+<div class="tile-value">—</div>
+<div class="tile-sub">Календарь хараахан холбогдоогүй</div>
+</div>
+<div class="card tile">
+<h3 class="tile-label">Дүрмийн төлөв</h3>
+<div id="rules-status" class="tile-value is-words">—</div>
+<div id="rules-note" class="tile-sub">—</div>
+</div>
+</section>
+
+<section id="chart" class="card chart-card" aria-labelledby="chart-title">
+<div class="chart-head">
+<div class="chart-heading">
+<h2 id="chart-title" class="chart-title">XAUUSD · M15</h2>
+<div class="ohlc" aria-label="Лааны үнэ">
+<span id="ohlc-o">O —</span>
+<span id="ohlc-h">H —</span>
+<span id="ohlc-l">L —</span>
+<span id="ohlc-c">C —</span>
+<span id="ohlc-chg" class="ohlc-change"></span>
+<span id="ohlc-forming" class="ohlc-forming" hidden>бүрэлдэж буй</span>
+</div>
+</div>
+<div class="tf-controls">
+<div id="tf-quick" class="segmented" role="group" aria-label="Дуртай хугацаа"></div>
+<div class="tf-pick">
+<button type="button" id="tf-button" class="tf-button" aria-haspopup="dialog" aria-expanded="false" aria-controls="tf-menu" title="Графикийн хугацаа">
+<span id="tf-current">M15</span>
+<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M6 9l6 6 6-6"/></svg>
+</button>
+<div id="tf-menu" class="tf-menu" role="dialog" aria-label="Графикийн хугацаа" hidden></div>
+</div>
+</div>
+</div>
+<div id="chart-notes" class="chart-notes" hidden></div>
+<div class="chart-box">
+<div id="chart-el" class="chart-el" role="img" aria-label="XAUUSD лааны график"></div>
+<div id="chart-msg" class="chart-msg">График ачаалж байна</div>
+</div>
+<div class="chart-legend">
+<span class="key"><span class="swatch swatch-buy" aria-hidden="true"></span><span>BUY сигнал</span></span>
+<span class="key"><span class="swatch swatch-sell" aria-hidden="true"></span><span>SELL сигнал</span></span>
+<span class="key"><span class="swatch swatch-zone" aria-hidden="true"></span><span>Орох бүс, хүчинтэй хугацаанд</span></span>
+<span class="key"><span class="swatch swatch-tp" aria-hidden="true"></span><span>TP</span></span>
+<span class="key"><span class="swatch swatch-sl" aria-hidden="true"></span><span>SL</span></span>
+<span class="key"><span class="swatch swatch-forming" aria-hidden="true"></span><span>Бүрэлдэж буй лаа</span></span>
+<span class="key" title="M15 дээр дараагийн 4 лааны (60 минут) хаалтын таамгийг зурах зай. Одоогоор таамаг гаргадаг модель алга."><span class="swatch swatch-forecast" aria-hidden="true"></span><span id="forecast-state">Таамаг бэлэн биш</span></span>
+<span class="dim">Эх үүсвэр: <span data-source="full">—</span>. Брокерын ханшаас зөрж болно.</span>
+</div>
+</section>
+
+<section class="card reasons" aria-labelledby="reasons-title">
+<h3 id="reasons-title" class="label">Үндэслэл</h3>
+<div id="reasons-body" class="reasons-body">
+<span class="meta-line">Ачаалж байна</span>
+</div>
+</section>
+
+</div>
+</div>
+
+<div class="row">
+
+<section id="log" class="card panel panel-wide" aria-labelledby="log-title">
+<div class="panel-head">
+<h2 id="log-title" class="label">Сигналын түүх</h2>
+<div id="log-count" class="panel-note"></div>
+</div>
+<div id="log-wrap" class="table-wrap is-tall" role="region" aria-labelledby="log-title" tabindex="0" hidden>
+<table class="table log-table">
+<thead>
+<tr>
+<th scope="col">Цаг</th>
+<th scope="col">Чиглэл</th>
+<th scope="col">Үр дүн</th>
+<th scope="col" class="num">Жишиг үнэ</th>
+<th scope="col" class="num">SL</th>
+<th scope="col" class="num">TP</th>
+<th scope="col">Зэрэглэл</th>
+</tr>
+</thead>
+<tbody id="log-body"></tbody>
+</table>
+</div>
+<div id="log-empty" class="empty">Ачаалж байна</div>
+<div class="panel-note">Үр дүнг жишиг үнээс эхлэн <span data-source="name">—</span> ханшаар тооцсон. Таны бодит арилжааны үр дүн биш.</div>
+<div class="log-legend">
+<span>Тайлбар:</span>
+<span class="log-legend-item"><span class="tag tag-up">Хүчинтэй</span><span>орох хугацаа дуусаагүй</span></span>
+<span class="log-legend-item"><span class="tag tag-neutral">Үр дүн гараагүй</span><span>орох хугацаа дууссан, TP, SL-ийн алинд нь ч хүрээгүй</span></span>
+<span class="tag tag-up">TP-д хүрсэн</span>
+<span class="tag tag-down">SL-д хүрсэн</span>
+</div>
+</section>
+
+<section id="news" class="card panel panel-narrow" aria-labelledby="news-title">
+<div class="panel-head is-centered">
+<h2 id="news-title" class="label">Эдийн засгийн календарь</h2>
+</div>
+<div class="empty">Календарь хараахан холбогдоогүй. Мэдээний шүүлтүүр идэвхгүй.</div>
+<div class="panel-foot">
+<div class="panel-note">Холбогдсоны дараа: өндөр нөлөөтэй USD мэдээний өмнөх 30, дараах 15 минутад сигнал гарахгүй.</div>
+</div>
+</section>
+
+<section id="digest" class="card panel panel-narrow" aria-labelledby="digest-title">
+<div class="panel-head is-centered">
+<h2 id="digest-title" class="label">AI мэдээний нэгтгэл</h2>
+</div>
+<div class="empty">AI нэгтгэл хараахан холбогдоогүй. Сигнал бүр B зэрэглэлтэй.</div>
+<div class="panel-foot">
+<div class="small tone-muted">Зэрэглэл: A = мэдээ сигналтай нийцсэн · B = мэдээ саармаг эсвэл нэгтгэл байхгүй · C = мэдээ сигналын эсрэг</div>
+<div class="panel-note">AI зөвхөн зэрэглэл тогтооно. Сигналын чиглэл, түвшнийг өөрчлөхгүй.</div>
+</div>
+</section>
+
+</div>
+
+<div class="row row-reverse">
+
+<section id="stats" class="card panel panel-wide" aria-labelledby="stats-title">
+<div class="panel-head is-centered">
+<h2 id="stats-title" class="label">Статистик</h2>
+<span class="tag tag-warn">Backtest хийгдээгүй</span>
+</div>
+<div class="table-wrap" role="region" aria-labelledby="stats-title" tabindex="0">
+<table class="table stats-table">
+<thead>
+<tr>
+<th scope="col">Үзүүлэлт</th>
+<th scope="col" class="num">Backtest</th>
+<th scope="col" class="num">Бодит</th>
+</tr>
+</thead>
+<tbody>
+<tr><th scope="row">Арилжааны тоо</th><td class="num">—</td><td class="num">—</td></tr>
+<tr><th scope="row">Хожлын хувь</th><td class="num">—</td><td class="num">—</td></tr>
+<tr><th scope="row">Дундаж үр дүн (R)</th><td class="num">—</td><td class="num">—</td></tr>
+<tr><th scope="row">Ашгийн фактор</th><td class="num">—</td><td class="num">—</td></tr>
+<tr><th scope="row">Хамгийн их уналт (max drawdown), R</th><td class="num">—</td><td class="num">—</td></tr>
+<tr><th scope="row">Хамгийн урт дараалсан алдагдал</th><td class="num">—</td><td class="num">—</td></tr>
+</tbody>
+</table>
+</div>
+<div class="small tone-muted">Ашиг, алдагдал тэнцэх хожлын хувь 42.9% (SL 1.5 × ATR, TP 2.0 × ATR, спред тооцоогүй). 1R = SL хүртэлх зай.</div>
+<div class="panel-note">Шалгуур: өгөгдлийн сүүлийн 30%-д 100-гаас доошгүй арилжаа, зардал хассаны дараа дундаж үр дүн эерэг. Backtest 4-р шатанд, бодит бүртгэл 6-р шатнаас эхэлнэ.</div>
+</section>
+
+<section id="alerts" class="card panel panel-narrow" aria-labelledby="alerts-title">
+<div class="panel-head is-centered">
+<h2 id="alerts-title" class="label">Системийн мэдэгдэл</h2>
+</div>
+<ul id="alerts-list" class="alerts" aria-labelledby="alerts-title" tabindex="0" hidden></ul>
+<div id="alerts-empty" class="empty">Ачаалж байна</div>
+<div class="panel-foot">
+<div id="email-note" class="panel-note"></div>
+<button type="button" id="email-test" class="btn btn-small" hidden>Туршилтын и-мэйл илгээх</button>
+<div id="email-result" class="result" role="status"></div>
+</div>
+</section>
+
+</div>
+
+</main>
+
+<footer class="card footer">
+<div class="legend">
+<span class="legend-item"><span class="shape shape-ok" aria-hidden="true"></span><span>Хэвийн</span></span>
+<span class="legend-item"><span class="shape shape-warn" aria-hidden="true"></span><span>Анхаарах</span></span>
+<span class="legend-item"><span class="shape shape-down" aria-hidden="true"></span><span>Зогссон</span></span>
+</div>
+<div>Сигнал нь санхүүгийн зөвлөгөө биш. Систем захиалга илгээдэггүй, арилжааг та MT5 дээр өөрөө хийнэ.</div>
+</footer>
+
+</div>
+
+</div>
+
+<div id="sr-live" class="sr-only" role="status" aria-live="polite"></div>
+</body>
+</html>

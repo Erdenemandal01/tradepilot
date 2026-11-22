@@ -17,3 +17,6 @@ data/*
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local tool settings
+.claude/

@@ -53,6 +53,9 @@ class Quote:
 class DataSource(ABC):
     name: str
     symbol: str
+    # Candle lengths the chart may ask this source for directly, besides the
+    # signal timeframe. Empty: the chart is built from the signal candles only.
+    chart_timeframes: tuple[str, ...] = ()
 
     @abstractmethod
     def fetch_candles(self, timeframe: str, limit: int = 500) -> pd.DataFrame:

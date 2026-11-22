@@ -36,12 +36,25 @@ from backend.app.datasource.base import (
 )
 
 BASE_URL = "https://fapi.binance.com"
-INTERVALS = {"M1": "1m", "M5": "5m", "M15": "15m", "M30": "30m", "H1": "1h", "H4": "4h", "D1": "1d"}
+INTERVALS = {
+    "M1": "1m",
+    "M3": "3m",
+    "M5": "5m",
+    "M15": "15m",
+    "M30": "30m",
+    "H1": "1h",
+    "H2": "2h",
+    "H4": "4h",
+    "D1": "1d",
+    "W1": "1w",  # opens on Monday 00:00 UTC
+    "MN1": "1M",  # opens on the first of the month, 00:00 UTC
+}
 MAX_LIMIT = 1500
 
 
 class BinanceSource(DataSource):
     name = "binance"
+    chart_timeframes = tuple(INTERVALS)
 
     def __init__(
         self,
