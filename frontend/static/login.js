@@ -20,9 +20,11 @@
 
   let busy = false;
   let waitTimer = null;
+  let holdSaid = false; // the message box shows "try again in N seconds" of the running pause
 
   function showMessage(text, options) {
     const settings = options || {};
+    holdSaid = false;
     box.replaceChildren();
     box.className = settings.wait ? 'msg is-wait' : 'msg';
     const line = document.createElement('span');
@@ -37,6 +39,7 @@
   }
 
   function clearMessage() {
+    holdSaid = false;
     box.hidden = true;
     box.replaceChildren();
   }
@@ -51,21 +54,44 @@
 
   /*
    * After too many wrong passwords the server asks for a pause: hold the button until
-   * that moment. The end is a time of day, not a count of timer firings, so a PC that
-   * slept or a tab in the background is released as soon as the pause is really over.
+   * that moment. The end is a moment, not a count of timer firings, so a PC that slept
+   * or a tab in the background is released as soon as the pause is really over.
+   *
+   * Two clocks measure it: the time of day (it goes on while the PC sleeps) and the
+   * browser's running clock (it does not jump when the time of day is set back). The
+   * pause ends when either says so, and it never shows or lasts more than was asked.
    */
-  let holdUntil = 0;
+  let holdSeconds = 0;
+  let holdWallEnd = 0;
+  let holdMonoEnd = 0;
+
+  function monoNow() {
+    return typeof performance === 'object' && performance && typeof performance.now === 'function' ? performance.now() : null;
+  }
+
+  function holdLeft() {
+    let left = Math.min(holdSeconds, Math.ceil((holdWallEnd - Date.now()) / 1000));
+    const mono = monoNow();
+    if (mono !== null) {
+      left = Math.min(left, Math.ceil((holdMonoEnd - mono) / 1000));
+    }
+    return left;
+  }
 
   function paintHold() {
     if (waitTimer === null) {
       return;
     }
-    const left = Math.ceil((holdUntil - Date.now()) / 1000);
+    const left = holdLeft();
     if (left <= 0) {
       window.clearInterval(waitTimer);
       waitTimer = null;
       button.textContent = BUTTON_TEXT;
       button.disabled = busy;
+      if (holdSaid) {
+        // The box still says "try again in N seconds": that is over now.
+        showMessage('Одоо дахин оролдож болно.');
+      }
       return;
     }
     button.textContent = BUTTON_TEXT + ' · ' + left + ' сек';
@@ -75,7 +101,10 @@
     if (waitTimer !== null) {
       window.clearInterval(waitTimer);
     }
-    holdUntil = Date.now() + seconds * 1000;
+    const mono = monoNow();
+    holdSeconds = seconds;
+    holdWallEnd = Date.now() + seconds * 1000;
+    holdMonoEnd = mono === null ? 0 : mono + seconds * 1000;
     button.disabled = true;
     waitTimer = window.setInterval(paintHold, 1000);
     paintHold();
@@ -91,6 +120,7 @@
   }
 
   async function submit() {
+    paintHold(); // a pause that is over is ended here too, before any timer or focus event
     if (busy || waitTimer !== null) {
       return;
     }
@@ -146,6 +176,7 @@
         showMessage('Олон удаа буруу оруулсан. Түр хүлээгээд дахин оролдоно уу.', { wait: true });
       } else {
         showMessage('Олон удаа буруу оруулсан. ' + seconds + ' секундын дараа дахин оролдоно уу.', { wait: true });
+        holdSaid = true;
         holdFor(seconds);
       }
     } else if (response.status === 503) {

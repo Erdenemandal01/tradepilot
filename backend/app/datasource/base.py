@@ -65,6 +65,18 @@ class DataSource(ABC):
     def fetch_quote(self) -> Quote:
         """The latest price."""
 
+    def fetch_history(self, timeframe: str, start: int | None = None, end: int | None = None) -> pd.DataFrame:
+        """Every candle the source has from ``start`` to ``end`` (open times, UTC seconds), oldest first.
+
+        Without ``start`` it begins at the oldest candle the source has;
+        without ``end`` it runs to now. The shape is that of ``fetch_candles``:
+        the newest candle is marked closed only when the source listed a newer
+        one. A source may need many requests for this and must pace them. It
+        is for fitting and backtests, never for the live loop. A source that
+        cannot do it raises NotImplementedError.
+        """
+        raise NotImplementedError(f"the {self.name} source cannot read older candles in pages")
+
 
 def check_limit(limit: int, maximum: int) -> None:
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= maximum:

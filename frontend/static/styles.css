@@ -1311,6 +1311,74 @@ button {
   border-top: 2px dashed var(--forecast);
 }
 
+/* A forecast with no measured edge is drawn dimmer; no line on the chart: dimmer still. */
+.swatch-forecast.is-dim {
+  opacity: 0.55;
+}
+
+.swatch-forecast.is-off {
+  opacity: 0.3;
+}
+
+/* ---------- forecast words under the chart ---------- */
+
+.forecast-box {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--inset);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.forecast-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+
+.forecast-title {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.forecast-body {
+  display: grid;
+  gap: 6px;
+}
+
+.forecast-line {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.forecast-word,
+.forecast-num {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.forecast-num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.forecast-record {
+  color: var(--dim);
+}
+
+.forecast-foot {
+  margin: 0;
+  font-size: 12px;
+  color: var(--dim);
+}
+
 .swatch-sl {
   width: 14px;
   border-top: 2px dashed var(--down);

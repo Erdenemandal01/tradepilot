@@ -270,6 +270,72 @@ def test_merge_refuses_a_hole_that_was_not_there_before_and_bears_it_once_it_is_
     assert again is not None and again["time"].tolist() == reloaded["time"].tolist()
 
 
+def test_lay_over_names_the_holes_that_are_news_and_merge_refuses_them():
+    whole = trend(20)
+    stored = forming_last(whole.iloc[:10])
+    tail = forming_last(whole.iloc[[8, 10, 11]])
+    merged, news = cd.lay_over(stored, tail, "M15")
+    assert merged["time"].tolist() == whole["time"].iloc[[*range(9), 10, 11]].tolist()
+    assert [(gap.after, gap.before, gap.missing) for gap in news] == [
+        (int(whole["time"].iloc[8]), int(whole["time"].iloc[10]), 1)
+    ]
+    assert cd.merge(stored, tail, "M15") is None
+    # A hole the stored candles already had is not news.
+    again, news = cd.lay_over(merged, tail, "M15")
+    assert news == [] and again["time"].tolist() == merged["time"].tolist()
+    # A tail that does not connect gives no frame at all.
+    assert cd.lay_over(stored, forming_last(whole.iloc[12:15]), "M15") == (None, [])
+    # A tail that brings the missing candle heals the hole: nothing is news then either.
+    healed, news = cd.lay_over(merged, forming_last(whole.iloc[8:12]), "M15")
+    assert news == [] and healed["time"].tolist() == whole["time"].iloc[:12].tolist()
+
+
+def test_a_hole_that_is_filled_in_part_is_not_news_but_a_stored_candle_that_is_lost_is():
+    whole = forming_last(trend(30))
+    stored = whole.drop(whole.index[[10, 11, 12]]).reset_index(drop=True)  # three candles the source did not list
+    hole = (int(whole["time"].iloc[9]), int(whole["time"].iloc[13]))
+    assert [(gap.after, gap.before) for gap in cd.find_gaps(stored, "M15")] == [hole]
+
+    # The source now lists the middle one. The hole became two smaller ones; no stored candle is lost.
+    partly = whole.drop(whole.index[[10, 12]]).reset_index(drop=True)
+    merged, news = cd.lay_over(stored, partly.iloc[9:], "M15")
+    assert news == [] and merged["time"].tolist() == partly["time"].tolist()
+    assert len(cd.find_gaps(merged, "M15")) == 2
+    assert cd.merge(stored, partly.iloc[9:], "M15")["time"].tolist() == partly["time"].tolist()  # no reload for it
+    # The same when the hole only shrinks from one side.
+    merged, news = cd.lay_over(stored, whole.drop(whole.index[[10, 11]]).iloc[9:], "M15")
+    assert news == [] and int(whole["time"].iloc[12]) in merged["time"].tolist()
+
+    # A hole that grew took a stored candle with it: that is news, on either side.
+    for lost in (9, 13):
+        tail = whole.drop(whole.index[[10, 11, 12, lost]]).iloc[8:]
+        merged, news = cd.lay_over(stored, tail, "M15")
+        assert [(gap.after, gap.before) for gap in news] == [
+            (int(whole["time"].iloc[min(lost, 10) - 1]), int(whole["time"].iloc[max(lost, 12) + 1]))
+        ]
+        assert int(whole["time"].iloc[lost]) not in merged["time"].tolist()
+        assert cd.merge(stored, tail, "M15") is None
+    # And so is a hole somewhere else, beside the part of the old one that was filled.
+    tail = whole.drop(whole.index[[10, 12, 20]]).iloc[9:]
+    merged, news = cd.lay_over(stored, tail, "M15")
+    assert [(gap.after, gap.before) for gap in news] == [(int(whole["time"].iloc[19]), int(whole["time"].iloc[21]))]
+
+
+def test_hole_reach_is_the_tail_that_covers_the_young_holes_and_nothing_for_an_old_one():
+    whole = forming_last(trend(60))
+    assert cd.hole_reach(whole, "M15", 50) == 0  # no hole
+    assert cd.hole_reach(whole.iloc[:0], "M15", 50) == 0
+    holed = whole.drop(whole.index[[20, 50, 51]]).reset_index(drop=True)
+    # The youngest hole lies after row 49: places 49 to 59 are 11 candles. The older one lies after row 19.
+    assert cd.hole_reach(holed, "M15", 11) == 11 and cd.hole_reach(holed, "M15", 40) == 11
+    assert cd.hole_reach(holed, "M15", 41) == 41  # both within reach: from the candle before the older one
+    assert cd.hole_reach(holed, "M15", 10) == 0  # further back than allowed: left alone
+    healed, news = cd.lay_over(holed, whole.iloc[-11:], "M15")  # a tail of that length does heal it
+    assert news == [] and [gap.after for gap in cd.find_gaps(healed, "M15")] == [int(whole["time"].iloc[19])]
+    healed, news = cd.lay_over(holed, whole.iloc[-41:], "M15")
+    assert news == [] and cd.find_gaps(healed, "M15") == []
+
+
 def test_replay_stops_a_candle_that_closed_under_a_stale_price_and_does_not_count_it_as_sent():
     frame = trend(1400)
     plain = fl.replay(frame, "M15", count=80)

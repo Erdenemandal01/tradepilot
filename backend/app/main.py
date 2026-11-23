@@ -27,6 +27,7 @@ from backend.app import __version__, auth
 from backend.app.chart import ChartCandles, ChartUnavailable
 from backend.app.config import Settings, get_settings
 from backend.app.datasource import DataSource, make_source
+from backend.app.forecast import Forecaster
 from backend.app.live import HIGHER, LiveFeed
 from backend.app.notify import Notifier, make_notifier
 
@@ -51,10 +52,6 @@ SECURITY_HEADERS = {
     "cache-control": "no-store",  # prices and the session must never be served from a cache
 }
 KEEP_ALIVE_SECONDS = 15.0
-# The forecast the chart has a place for: the closes of the next candles of the
-# signal timeframe (4 x M15 = 60 minutes). Nothing in this project produces one
-# yet, so the page is told "not available" and draws nothing.
-PREDICTION_CANDLES = 4
 
 log = logging.getLogger("tradepilot.web")
 
@@ -163,6 +160,11 @@ def create_app(
         settings,
         notifier if notifier is not None else make_notifier(settings),
         executor=executor,
+        # The fitted forecast model, when the training script has written one.
+        # Only a model fitted on this very source and instrument is used.
+        forecaster=Forecaster.from_file(
+            settings.forecast_model_path, settings.signal_timeframe, (price_source.name, price_source.symbol)
+        ),
     )
     chart = ChartCandles(
         price_source, feed, refresh_seconds=settings.poll_seconds, history=settings.history_candles
@@ -305,7 +307,8 @@ def create_app(
                 "signal_timeframe": feed.timeframe,
                 "filter_timeframe": HIGHER,
             },
-            "prediction": {"available": False, "timeframe": feed.timeframe, "horizon_candles": PREDICTION_CANDLES},
+            # The forecast of the next four M15 closes with its measured record, or why there is none.
+            "prediction": feed.prediction(),
         }
 
     @api.get("/quote")

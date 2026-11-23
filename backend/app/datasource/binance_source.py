@@ -1,7 +1,8 @@
 """Binance USD-M futures, XAUUSDT perpetual: public market data, no API key.
 
-Only two public read-only endpoints are used: ``/fapi/v1/klines`` (candles)
-and ``/fapi/v1/ticker/bookTicker`` (best bid and ask). No account endpoints,
+Only two public read-only endpoints are used: ``/fapi/v1/klines`` (candles,
+also for older history in pages) and ``/fapi/v1/ticker/bookTicker`` (best bid
+and ask). No account endpoints,
 no keys, no signed requests.
 
 The contract is quoted in USDT and trades 24/7, so its price differs from a
@@ -19,6 +20,7 @@ delay: a candle is picked up on the first poll after the next one appears.
 from __future__ import annotations
 
 import time
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -50,6 +52,11 @@ INTERVALS = {
     "MN1": "1M",  # opens on the first of the month, 00:00 UTC
 }
 MAX_LIMIT = 1500
+# Reading history: one page is the largest request the exchange allows (it
+# costs 10 of the 2400 request weights a minute). A pause between pages keeps
+# the download far below that limit, next to a live feed on the same address.
+HISTORY_PAUSE = 0.5
+HISTORY_MAX_PAGES = 400  # 600,000 candles: a wall against a loop that never ends
 
 
 class BinanceSource(DataSource):
@@ -62,25 +69,30 @@ class BinanceSource(DataSource):
         get_json: JsonGetter = http.get_json,
         clock: Clock = time.time,
         base_url: str = BASE_URL,
+        sleep: Callable[[float], None] = time.sleep,
+        history_pause: float = HISTORY_PAUSE,
     ) -> None:
         self.symbol = symbol
         self._get_json = get_json
         self._clock = clock
         self._base_url = base_url
+        self._sleep = sleep
+        self._history_pause = history_pause
 
     def fetch_candles(self, timeframe: str, limit: int = 500) -> pd.DataFrame:
         check_limit(limit, MAX_LIMIT)
         if timeframe not in INTERVALS:
             raise ValueError(f"Binance source does not support timeframe {timeframe!r}")
-        rows = self._get_json(
-            f"{self._base_url}/fapi/v1/klines",
-            {"symbol": self.symbol, "interval": INTERVALS[timeframe], "limit": str(limit)},
-        )
+        records = self._klines({"symbol": self.symbol, "interval": INTERVALS[timeframe], "limit": str(limit)})
+        return self._frame(records, timeframe, newest_closed=False)
+
+    def _klines(self, params: dict[str, str]) -> list[dict[str, Any]]:
+        """One klines request, parsed. The rows carry no ``closed`` mark yet."""
+        rows = self._get_json(f"{self._base_url}/fapi/v1/klines", params)
         if not isinstance(rows, list):
             raise DataSourceError(f"Binance klines: unexpected response {str(rows)[:200]}")
         records = []
-        newest = len(rows) - 1
-        for index, row in enumerate(rows):
+        for row in rows:
             if not isinstance(row, list) or len(row) < 6:
                 raise DataSourceError(f"Binance klines: bad row {str(row)[:200]}")
             records.append(
@@ -91,14 +103,63 @@ class BinanceSource(DataSource):
                     "low": to_float(row[3], "low"),
                     "close": to_float(row[4], "close"),
                     "volume": to_float(row[5], "volume"),
-                    # Closed only when the response lists a newer candle.
-                    "closed": index < newest,
                 }
             )
+        return records
+
+    def _frame(self, records: list[dict[str, Any]], timeframe: str, *, newest_closed: bool) -> pd.DataFrame:
+        frame = pd.DataFrame(records, columns=list(cd.CANDLE_COLUMNS))
+        # Closed only when the exchange listed a newer candle.
+        frame["closed"] = True
+        if len(frame) and not newest_closed:
+            frame.loc[frame.index[-1], "closed"] = False
         try:
-            return cd.validate(pd.DataFrame(records, columns=list(cd.CANDLE_COLUMNS)), timeframe)
+            return cd.validate(frame, timeframe)
         except ValueError as exc:
             raise DataSourceError(f"Binance klines failed validation: {exc}") from None
+
+    def fetch_history(self, timeframe: str, start: int | None = None, end: int | None = None) -> pd.DataFrame:
+        """All candles from ``start`` (default: the oldest the exchange has) to ``end`` (default: now).
+
+        Read oldest first in pages of 1500 with a pause between them. Each
+        page starts just after the last candle of the page before, so pages
+        cannot overlap; a page that does not move forward is an error, not
+        something to patch over. A refusal (HTTP 418 or 429) or any other
+        failed request ends the download at once with DataSourceError: no
+        retry here, and no partial history is returned.
+        """
+        if timeframe not in INTERVALS:
+            raise ValueError(f"Binance source does not support timeframe {timeframe!r}")
+        if start is not None and end is not None and end < start:
+            raise ValueError("end is before start")
+        records: list[dict[str, Any]] = []
+        cursor = 0 if start is None else int(start) * 1000
+        newer_listed = False  # the exchange listed a candle after the last one kept
+        for page in range(HISTORY_MAX_PAGES):
+            if page:
+                self._sleep(self._history_pause)
+            rows = self._klines(
+                {
+                    "symbol": self.symbol,
+                    "interval": INTERVALS[timeframe],
+                    "startTime": str(cursor),
+                    "limit": str(MAX_LIMIT),
+                }
+            )
+            if rows and rows[0]["time"] * 1000 < cursor:
+                raise DataSourceError("Binance klines: a history page starts before the time asked for")
+            if end is not None:
+                kept = [row for row in rows if row["time"] <= end]
+                newer_listed = len(kept) < len(rows)
+                records += kept
+            else:
+                records += rows
+            if len(rows) < MAX_LIMIT or newer_listed:
+                break  # a short page: the exchange has nothing newer
+            cursor = rows[-1]["time"] * 1000 + 1
+        else:
+            raise DataSourceError(f"Binance klines: history did not end within {HISTORY_MAX_PAGES} pages")
+        return self._frame(records, timeframe, newest_closed=newer_listed)
 
     def fetch_quote(self) -> Quote:
         data = self._get_json(f"{self._base_url}/fapi/v1/ticker/bookTicker", {"symbol": self.symbol})

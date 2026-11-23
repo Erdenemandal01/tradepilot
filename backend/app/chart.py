@@ -32,6 +32,9 @@ from backend.app.core import candles as cd
 from backend.app.datasource.base import DataSource, DataSourceError
 
 TAIL = 3  # candles asked for on a refresh: the forming one and two before it
+# A hole among this many newest candles is asked for again each time a candle closes: the
+# source may list a candle late, and the short tail would never reach it.
+HOLE_REACH = 100
 REFUSED = (418, 429)
 # How many candles a full load asks for. Long candles need fewer: the request
 # is cheaper, and the instrument's history ends long before 1500 weeks.
@@ -146,6 +149,30 @@ class ChartCandles:
     def _ask(self, timeframe: str) -> int:
         return min(self._history, ASK.get(timeframe, self._history))
 
+    def _heal(self, timeframe: str, before: pd.DataFrame, frame: pd.DataFrame, ask: int) -> pd.DataFrame:
+        """When a candle has closed and a young hole is kept: one longer tail that reaches it.
+
+        The longer request is an extra. When it fails, or what it brings does
+        not fit, the chart keeps what the usual tail gave. Only a refusal
+        (asked to slow down) is passed on, so that the source is left alone.
+        """
+        if len(frame) < 2 or len(before) < 2 or int(frame["time"].iloc[-1]) == int(before["time"].iloc[-1]):
+            return frame
+        reach = cd.hole_reach(frame, timeframe, min(HOLE_REACH, ask))
+        if reach <= TAIL:
+            return frame
+        try:
+            healed, news = cd.lay_over(frame, self._source.fetch_candles(timeframe, reach), timeframe)
+        except ValueError:
+            return frame
+        except DataSourceError as error:
+            if error.status in REFUSED:
+                raise
+            return frame
+        if healed is None or news:
+            return frame
+        return healed.iloc[-ask:].reset_index(drop=True)
+
     def _from_source(self, timeframe: str) -> tuple[pd.DataFrame, bool]:
         with self._guard:
             kept = self._kept.setdefault(timeframe, _Kept())
@@ -164,6 +191,8 @@ class ChartCandles:
                         frame = cd.merge(kept.frame, tail, timeframe, keep=ask)
                     except ValueError:
                         frame = None  # the two do not fit together: load the whole history again
+                    if frame is not None:
+                        frame = self._heal(timeframe, kept.frame, frame, ask)
                     if frame is not None and len(frame) >= ask:
                         kept.short = False  # the oldest candles have been cut off since
                 if frame is None:

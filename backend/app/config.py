@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     # Times in emails are shown in this zone (UTC+8 is Ulaanbaatar).
     display_utc_offset_hours: int = 8
 
+    # The forecast model written by `python -m backend.scripts.train_forecast`.
+    # No file: no forecast is shown.
+    forecast_model_path: str = "data/forecast_model.json"
+
     # Login. Both are written by `python -m backend.scripts.set_password`.
     password_hash: SecretStr = SecretStr("")
     session_secret: SecretStr = SecretStr("")

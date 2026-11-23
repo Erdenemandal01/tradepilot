@@ -123,7 +123,13 @@ def site(tmp_path, monkeypatch):
         notifier: notify.Notifier | None = None, settings: Settings | None = None, cursor: int = FRIDAY, **values: Any
     ) -> Site:
         if settings is None:
-            base = {"password_hash": HASH, "session_secret": SECRET, "history_candles": HISTORY}
+            base = {
+                "password_hash": HASH,
+                "session_secret": SECRET,
+                "history_candles": HISTORY,
+                # Never the model a training run left in data/ on this PC.
+                "forecast_model_path": str(tmp_path / "no_forecast_model.json"),
+            }
             settings = Settings(_env_file=None, **{**base, **values})
         source = FakeSource(UP, cursor, FakeClock(opens_at(cursor - 1) + 3))
         notifier = notify.MemoryNotifier() if notifier is None else notifier
@@ -673,7 +679,11 @@ def test_state_is_the_feeds_snapshot_and_the_smaller_routes_are_parts_of_it(site
         "signal_timeframe": "M15",
         "filter_timeframe": "H1",
     }
-    assert prediction == {"available": False, "timeframe": "M15", "horizon_candles": 4}  # no model: nothing to draw
+    assert prediction == {  # no model file: nothing to draw, and the reason is said
+        "available": False, "reason": "no_model", "timeframe": "M15", "horizon_candles": 4, "made_at": None,
+        "base_price": None, "points": [], "up_probability": None, "direction": None, "skill": None,
+        "trained_at": None,
+    }  # fmt: skip
     assert state["price"] == float(UP["open"].iloc[FRIDAY - 1])
     assert state["source"] == {"name": "fake", "symbol": "XAUTEST"} and state["email"] is True
     assert 0 <= state["now"] - s.source.clock.now < 60  # the source's clock, carried on for the moments since

@@ -218,6 +218,64 @@ def test_a_tail_that_no_longer_connects_loads_the_history_again():
     assert bars[-1]["time"] == at(2026, 11, 20, 13, 17) and cd.count_breaks(pd.DataFrame(bars), "M1") == 0
 
 
+def test_a_young_hole_that_the_source_fills_later_is_picked_up_when_a_candle_closes(monkeypatch):
+    chart, source, clock, timer = make()
+    whole = source.fetch_candles
+    lacking = [at(2026, 11, 20, 12, 40)]  # one M5 candle the source does not list yet
+
+    def answer(timeframe: str, limit: int = 500) -> pd.DataFrame:
+        frame = whole(timeframe, limit + len(lacking))
+        return frame[~frame["time"].isin(lacking)].iloc[-limit:].reset_index(drop=True)
+
+    monkeypatch.setattr(source, "fetch_candles", answer)
+    assert chart.candles("M5", 1500)["gaps"] == 1
+    lacking.clear()  # now the source has it, far behind the three-candle tail
+    pass_seconds(3, clock, timer)
+    assert chart.candles("M5", 1500)["gaps"] == 1 and source.calls[-1] == ("M5", 3)  # no candle closed: tail only
+    pass_seconds(150, clock, timer)  # 13:10 has passed: a candle closed
+    answer_now = chart.candles("M5", 1500)
+    # One longer tail from the candle before the hole (12:35) to the forming one (13:10): 8 candles.
+    assert [call for call in source.calls if call[1] not in (3, 1500, 1501)] == [("M5", 8)]
+    assert answer_now["gaps"] == 0 and len(answer_now["bars"]) == 1500
+    assert [bar["time"] for bar in answer_now["bars"]] == whole("M5", 1500)["time"].tolist()
+    pass_seconds(300, clock, timer)
+    chart.candles("M5", 1500)
+    assert [call for call in source.calls if call[1] not in (3, 1500, 1501)] == [("M5", 8)]  # healed: tails again
+
+
+def test_a_longer_request_that_fails_costs_nothing_but_a_refusal_is_obeyed(monkeypatch):
+    chart, source, clock, timer = make()
+    whole = source.fetch_candles
+    lacking = [at(2026, 11, 20, 12, 40)]
+    fail: list[DataSourceError] = [DataSourceError("the longer request timed out")]
+
+    def answer(timeframe: str, limit: int = 500) -> pd.DataFrame:
+        if limit not in (3, 1500) and fail:
+            source.calls.append((timeframe, limit))
+            raise fail[0]
+        frame = whole(timeframe, limit + len(lacking))
+        return frame[~frame["time"].isin(lacking)].iloc[-limit:].reset_index(drop=True)
+
+    monkeypatch.setattr(source, "fetch_candles", answer)
+    assert chart.candles("M5", 1500)["gaps"] == 1
+    lacking.clear()
+    pass_seconds(150, clock, timer)  # a candle closed: the longer request is made, and fails
+    served = chart.candles("M5", 1500)  # the chart is served all the same, from what the tail gave
+    assert source.calls[-2:] == [("M5", 3), ("M5", 8)] and served["gaps"] == 1
+    assert served["bars"][-1]["time"] == at(2026, 11, 20, 13, 10)
+    pass_seconds(3, clock, timer)
+    assert chart.candles("M5", 1500)["gaps"] == 1 and source.calls[-1] == ("M5", 3)  # not tried again at once
+
+    fail[0] = DataSourceError("HTTP 429", status=429, retry_after=30.0)  # asked to slow down: that is obeyed
+    pass_seconds(300, clock, timer)
+    with pytest.raises(ch.ChartUnavailable) as refused:
+        chart.candles("M5", 1500)
+    assert refused.value.retry_after == 30.0
+    fail.clear()
+    pass_seconds(31, clock, timer)
+    assert chart.candles("M5", 1500)["gaps"] == 0  # the next try brings the candle
+
+
 # --- failures -------------------------------------------------------------------------------------------
 
 

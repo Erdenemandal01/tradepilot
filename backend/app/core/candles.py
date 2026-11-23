@@ -14,6 +14,7 @@ never see a source's own format.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -353,15 +354,18 @@ def resample(
     return validate(built, target_timeframe), partial
 
 
-def merge(stored: pd.DataFrame, fresh: pd.DataFrame, timeframe: str, keep: int | None = None) -> pd.DataFrame | None:
-    """Stored candles with a newer ``fresh`` tail from the same source laid over them.
+def lay_over(stored: pd.DataFrame, fresh: pd.DataFrame, timeframe: str) -> tuple[pd.DataFrame | None, list[Gap]]:
+    """Stored candles with a newer ``fresh`` tail laid over them, and the holes that are news.
 
     Fresh rows replace stored rows from their first time on, so a candle that
-    was still forming gets its final values. Returns None when the tail does
-    not connect: candles are missing between the two, the stored forming
+    was still forming gets its final values. The frame is None when the tail
+    does not connect: candles are missing between the two, the stored forming
     candle would stay unfinished in the middle, or the source went back in
-    time. The caller then reloads the whole history instead of guessing.
-    ``keep`` limits the result to the newest rows.
+    time. The list holds every hole of the result that does not lie inside a
+    hole the stored candles had: there a candle that was stored is gone, or
+    one is missing among the new ones. A hole the stored candles already had
+    is the source's own history and is not in it, and neither is what is left
+    of such a hole after the source filled a part of it.
     """
     step = timeframe_seconds(timeframe)
     if fresh.empty:
@@ -373,13 +377,49 @@ def merge(stored: pd.DataFrame, fresh: pd.DataFrame, timeframe: str, keep: int |
         last = int(stored["time"].iloc[-1])
         covered = last if bool(stored["closed"].iloc[-1]) else last - step
         if first > covered + step or int(fresh["time"].iloc[-1]) < last:
-            return None
+            return None, []
         merged = pd.concat([stored[stored["time"] < first], fresh], ignore_index=True)
     merged = validate(merged, timeframe)
-    # A hole the stored candles already had is the source's own history: loading
-    # everything again would bring the same hole back. Only a hole that was not
-    # there before means candles were missed.
-    known = set() if stored.empty else {(gap.after, gap.before) for gap in find_gaps(stored, timeframe)}
-    if any((gap.after, gap.before) not in known for gap in find_gaps(merged, timeframe)):
+    known = [] if stored.empty else [(gap.after, gap.before) for gap in find_gaps(stored, timeframe)]
+    return merged, [gap for gap in find_gaps(merged, timeframe) if not within((gap.after, gap.before), known)]
+
+
+def within(hole: tuple[int, int], known: Iterable[tuple[int, int]]) -> bool:
+    """Whether a hole, as (open time before, open time after), lies inside one of the ``known`` holes.
+
+    A known hole itself does, and so does what is left of it when some of its
+    candles turned up: no candle that was there before is missing then.
+    """
+    return any(after <= hole[0] and hole[1] <= before for after, before in known)
+
+
+def merge(stored: pd.DataFrame, fresh: pd.DataFrame, timeframe: str, keep: int | None = None) -> pd.DataFrame | None:
+    """Stored candles with a newer ``fresh`` tail from the same source laid over them.
+
+    See ``lay_over``. Returns None when the tail does not connect, or when
+    the result would have a hole the stored candles did not have: loading
+    everything again would bring an old hole back, so only a new one means
+    candles were missed. The caller then reloads the whole history instead of
+    guessing. ``keep`` limits the result to the newest rows.
+    """
+    merged, news = lay_over(stored, fresh, timeframe)
+    if merged is None or news:
         return None
     return merged.iloc[-keep:].reset_index(drop=True) if keep else merged
+
+
+def hole_reach(candles: pd.DataFrame, timeframe: str, newest: int) -> int:
+    """How many of the newest candles a request must ask for to cover the holes among them.
+
+    Counted from the candle before the oldest hole that begins within the
+    ``newest`` candles, up to the last one. 0 when there is no such hole: a
+    hole further back is the source's own history and is left alone.
+    """
+    step = timeframe_seconds(timeframe)
+    last = int(candles["time"].iloc[-1]) if len(candles) else 0
+    reach = 0
+    for gap in find_gaps(candles, timeframe):
+        need = (last - gap.after) // step + 1  # candle places from the one before the hole to the last
+        if need <= newest:
+            reach = max(reach, int(need))
+    return reach

@@ -30,6 +30,8 @@ Signals only. Full plan: docs/PLAN.md.
 - Login password: python -m backend.scripts.set_password (writes the hash to .env)
 - Web app: python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
   It runs the live feed loop itself (backend/app/live.py). API shapes: docs/WEB.md.
+- Forecast model: python -m backend.scripts.train_forecast (writes data/forecast_model.json
+  with its measured record; restart the web app afterwards)
 - Worker: python -m backend.app.worker (from Phase 6)
 
 ## Conventions
@@ -39,6 +41,9 @@ Signals only. Full plan: docs/PLAN.md.
 - The chart's timeframe (M1 to MN12, backend/app/chart.py, core/candles.resample) is a view
   only: signals stay on M15 with the H1 filter. Longer candles are built from real shorter
   ones, never over a hole. No forecast is drawn unless a real prediction output exists.
+- The forecast (core/forecast.py, backend/app/forecast.py) is shown beside the signals and never
+  creates, flips, blocks or grades one. It is shown only from a fitted model file and always with
+  its measured walk-forward record; when that record is no better than the baseline, say so.
 - Web UI text is Mongolian (Cyrillic). Look and layout follow docs/PLAN.md section 11,
   which the owner approved from a mock-up on 2026-11-11.
 - The pages load nothing from other hosts (strict content security policy). Third-party

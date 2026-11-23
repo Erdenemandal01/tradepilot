@@ -13,13 +13,20 @@ Rules kept here:
 - Closed candles only: the source marks a candle closed when it lists a newer one.
 - A signal is announced once, when its candle closes while the feed is
   running. After a restart the history is replayed for display, not re-sent.
+- A candle is decided once. Whatever the source answers later (a copy that is
+  behind, a candle that is missing from one answer, a whole-history reload),
+  a decision already made stays exactly as it was made.
 - Signals only: this module reads prices and sends messages, nothing else.
+- The forecast (backend/app/forecast.py) is made after the signals of a cycle
+  are decided and announced. It never changes them, and an error in it costs
+  the forecast only.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import threading
 import time
 from collections import deque
@@ -27,13 +34,16 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any, Callable
 
+import numpy as np
 import pandas as pd
 
+from backend.app import forecast as fcast
 from backend.app import notify
 from backend.app.config import Settings
 from backend.app.core import candles as cd
 from backend.app.core import filters as fl
 from backend.app.core.pricecheck import probably_closed
+from backend.app.core.signal import params_for
 from backend.app.datasource.base import DataSource, DataSourceError, Quote
 
 log = logging.getLogger("tradepilot.live")
@@ -43,6 +53,10 @@ REPLAY = 192  # closed candles judged again after a (re)load: 48 hours of M15
 KEEP_DECISIONS = 600
 LOG_ROWS = 60
 LATE_AFTER = 10.0  # seconds without fresh data before the feed is shown as late
+LATE_POLLS = 2.5  # with a slow poll: this many poll intervals instead, when that is longer
+LATE_CAP = 0.75  # but never later than this share of stale_after_seconds, so "late" always comes before "down"
+HOLE_QUIET = 60.0  # seconds: the same hole is not reloaded for, or said, again within this time
+HOLE_AGE = 86400  # seconds: a hole younger than this is asked for again each time a candle closes
 REFUSED = (418, 429)
 HIGHER = fl.HIGHER_TIMEFRAME
 
@@ -69,8 +83,10 @@ class LiveFeed:
         timer: Callable[[], float] = time.monotonic,
         closed_hours: Callable[[float], bool] = probably_closed,
         executor: Executor | None = None,
+        forecaster: fcast.Forecaster | None = None,
     ) -> None:
         self._source = source
+        self._forecaster = forecaster  # None: no forecast is made or shown
         self._notifier = notifier
         self._clock = clock
         self._timer = timer
@@ -85,7 +101,10 @@ class LiveFeed:
         self._history = int(settings.history_candles)
         self._stale_after = float(settings.stale_after_seconds)
         # Fresh data comes once per poll: with a slow poll the feed is not late between two answers.
-        self._late_after = max(LATE_AFTER, 2.5 * self._poll_seconds)
+        # Capped below the stale limit, so a feed always reads late before it reads down.
+        self._late_after = min(max(LATE_AFTER, LATE_POLLS * self._poll_seconds), LATE_CAP * self._stale_after)
+        self._valid_bars = int(params_for(self.timeframe).valid_bars)  # how many candles a signal lives
+        self._deep_tail = min(HOLE_AGE // self._step + TAIL, self._history)
         self._alert_after = float(settings.alert_after_seconds)
         self._offset_hours = int(settings.display_utc_offset_hours)
 
@@ -93,10 +112,14 @@ class LiveFeed:
         self._candles: pd.DataFrame | None = None
         self._decisions: list[fl.Decision] = []
         self._last_sent: fl.Decision | None = None
+        self._decided = 0  # close time of the newest candle that has been decided: it is never decided again
         self._announced = 0  # signal time of the newest decision that needs no announcement any more
         self._outcomes: dict[int, tuple[str, int]] = {}
-        self._stale_times: set[int] = set()  # close times of candles that closed while the price was stale
-        self._holes = 0  # places where the loaded history itself lacks candles
+        # Places where the stored history lacks candles, as (open time before, open time after).
+        self._holes: set[tuple[int, int]] = set()
+        self._hole_said: dict[tuple[int, int], float] = {}  # when each hole was last there (the feed's stopwatch)
+        self._hole_reloads: dict[tuple[int, int], float] = {}  # when the history was last reloaded for each hole
+        self._heal_refused: DataSourceError | None = None  # the source refused the longer tail in this cycle
         self._quote: Quote | None = None
         self._quote_at = 0.0
         self._source_time: float | None = None  # newest time the source has reported
@@ -191,6 +214,9 @@ class LiveFeed:
             else:
                 with self._lock:
                     self._apply(frame, quote, reload)
+                refused, self._heal_refused = self._heal_refused, None
+                if refused is not None:
+                    wait = self._failed(refused)
         finally:
             with self._lock:
                 self._judge_feed()
@@ -200,23 +226,67 @@ class LiveFeed:
 
     def _fetch(self) -> tuple[pd.DataFrame, Quote, bool]:
         """Network part of a cycle, done without holding the lock."""
-        reload = self._candles is None
+        stored = self._candles
+        reload = stored is None
+        self._heal_refused = None
         # The quote is asked for at the same moment as the candles, not after them.
         quote = self._side_request.submit(self._source.fetch_quote)
         try:
             frame = self._source.fetch_candles(self.timeframe, self._history if reload else TAIL)
-            if not reload:
-                merged = cd.merge(self._candles, frame, self.timeframe, keep=self._history)
-                if merged is None:  # the tail does not connect: candles were missed
+            if stored is not None:
+                merged, news = cd.lay_over(stored, frame, self.timeframe)
+                pairs = [(gap.after, gap.before) for gap in news]
+                if merged is None or (pairs and not self._reloaded_lately(pairs)):
+                    # The tail does not connect, or a candle is missing that was not missing before.
                     reload = True
+                    self._note_reload(pairs)
                     frame = self._source.fetch_candles(self.timeframe, self._history)
                 else:
-                    frame = merged
+                    # A hole the history was reloaded for less than a minute ago is borne as the
+                    # source gives it: its answers disagree, and asking for everything again
+                    # on every change would not settle that.
+                    frame = self._heal(stored, merged).iloc[-self._history :].reset_index(drop=True)
         except BaseException:
             if not quote.cancel():  # already running: wait, so two cycles never overlap
                 quote.exception()
             raise
         return frame, quote.result(), reload
+
+    def _reloaded_lately(self, pairs: list[tuple[int, int]]) -> bool:
+        now = self._timer()
+        return all(now - self._hole_reloads.get(pair, -math.inf) < HOLE_QUIET for pair in pairs)
+
+    def _note_reload(self, pairs: list[tuple[int, int]]) -> None:
+        now = self._timer()
+        self._hole_reloads = {pair: at for pair, at in self._hole_reloads.items() if now - at < HOLE_QUIET}
+        self._hole_reloads.update((pair, now) for pair in pairs)
+
+    def _heal(self, stored: pd.DataFrame, merged: pd.DataFrame) -> pd.DataFrame:
+        """Ask once per closed candle for a tail that reaches the young holes, if there are any.
+
+        A source can list a candle late. Once that candle is older than the
+        usual tail nothing would ever pick it up. So when a candle closes and
+        the stored history has a hole younger than a day, one longer tail is
+        asked for, from the candle before the oldest such hole on. What it
+        brings is used only when it connects and costs no candle the feed
+        has: a hole that became smaller is taken, a new one is not. Otherwise
+        the frame stays as it is. Candles decided before are not decided again.
+        """
+        if self._last_closed(merged) <= self._last_closed(stored):
+            return merged
+        reach = cd.hole_reach(merged, self.timeframe, self._deep_tail)
+        if reach <= TAIL:
+            return merged
+        try:
+            healed, news = cd.lay_over(merged, self._source.fetch_candles(self.timeframe, reach), self.timeframe)
+        except (DataSourceError, ValueError) as error:
+            log.info("live feed: the longer tail for a hole gave nothing: %s", error)
+            if isinstance(error, DataSourceError) and error.status in REFUSED:
+                # Asked to slow down. This cycle's own answers are good and are used; the wait
+                # before the next cycle is the one a refusal gets (see poll).
+                self._heal_refused = error
+            return merged
+        return merged if healed is None or news else healed
 
     def _failed(self, error: DataSourceError) -> float:
         with self._lock:
@@ -238,7 +308,6 @@ class LiveFeed:
 
     def _apply(self, frame: pd.DataFrame, quote: Quote, reload: bool) -> None:
         first_load = self._candles is None
-        before = self._last_closed(self._candles)
         self._candles = frame
         # The quote first: every alert below is then stamped by the source's clock.
         self._quote = quote
@@ -271,64 +340,97 @@ class LiveFeed:
         stale = self._status == "down"
 
         closes = frame.loc[frame["closed"], "time"] + self._step  # when each closed candle closed
+        newest = int(closes.iloc[-1]) if len(closes) else 0
         fresh: list[fl.Decision] = []
-        if reload:
-            if stale and len(closes):
-                # Only candles not decided before are held back. What was decided, and maybe
-                # announced, while the feed was fine stays as it was decided.
-                undecided = closes.iloc[-1:] if first_load else closes[closes > self._announced]
-                self._stale_times.update(int(at) for at in undecided)
-            decisions = fl.replay(
-                frame, self.timeframe, REPLAY, closed_hours=self._closed_hours, stale_times=self._stale_times
+        if first_load:
+            # The history is judged for the log and the chart. Only the newest candle can have
+            # closed under a stale price here: the others closed before this process looked.
+            marks = {newest} if stale and newest else set()
+            self._decisions = fl.replay(
+                frame, self.timeframe, REPLAY, closed_hours=self._closed_hours, stale_times=marks
             )
-            self._decisions = decisions
             self._last_sent = next((d for d in reversed(self._decisions) if d.sent), None)
-            self._outcomes.clear()
-            if first_load:
-                self._announced = self._last_closed(frame) + self._step
-                self._alert("ok", "started", email=True)
-            else:
-                # Candles were missed. Every decision not looked at yet is looked at now: a
-                # signal lives for two candles, so the one before the newest can still be valid.
-                fresh = [d for d in decisions if (d.result.signal_time or 0) > self._announced]
-                self._alert("warn", "reloaded")
-            holes = len(cd.find_gaps(frame, self.timeframe))
-            if holes != self._holes:
-                # The source's own history lacks candles. Said once, not on every cycle.
-                self._holes = holes
-                if holes:
-                    self._alert("warn", "history_gaps", count=holes)
+            self._decided = newest
+            # Nothing that closed before this first answer is announced, also when the answer
+            # came from a copy of the source that is behind: the clock sets the line as well.
+            boundary = int(cd.opens(pd.Series([int(self.now())]), self.timeframe).iloc[0])
+            self._announced = max(newest, boundary)
+            self._alert("ok", "started", email=True)
             self._version += 1
         else:
-            new = closes[closes > before + self._step]
+            if reload:
+                self._alert("warn", "reloaded")
+            # Only candles not decided before are decided, after a reload as on any other cycle.
+            # What was decided, and maybe announced, stays as it was decided: neither a reload
+            # nor an answer from a copy that is behind can rewrite it.
+            new = closes[closes > self._decided]
             if len(new):
-                if stale:
-                    self._stale_times.update(int(at) for at in new)
+                marks = {int(at) for at in new} if stale else set()
                 fresh = fl.replay(
                     frame,
                     self.timeframe,
-                    len(new),
+                    min(len(new), REPLAY),
                     previous=self._last_sent,
                     closed_hours=self._closed_hours,
-                    stale_times=self._stale_times,
+                    stale_times=marks,
                 )
                 self._decisions = (self._decisions + fresh)[-KEEP_DECISIONS:]
                 for decision in fresh:
                     if decision.sent:
                         self._last_sent = decision
+                self._decided = newest
                 self._version += 1
-        if self._stale_times:
-            oldest = int(frame["time"].iloc[0])
-            self._stale_times = {at for at in self._stale_times if at > oldest}
+        self._note_holes(frame)
 
         now = self.now()
+        # By count, not by the clock alone: a signal lives for ``valid_bars`` candles, so a
+        # decision older than that many closed candles has run out whatever the clock says.
+        oldest_valid = newest - self._valid_bars * self._step
         for decision in fresh:
             at = decision.result.signal_time or 0
             if at <= self._announced:
                 continue
             self._announced = at
-            if decision.sent and fl.signal_state(decision, None, now) != fl.EXPIRED:
+            if decision.sent and at > oldest_valid and fl.signal_state(decision, None, now) != fl.EXPIRED:
                 self._announce(decision)
+        if len(self._outcomes) > KEEP_DECISIONS:
+            kept = {d.result.signal_time for d in self._decisions}
+            self._outcomes = {key: value for key, value in self._outcomes.items() if key in kept}
+        self._forecast(frame)
+
+    def _note_holes(self, frame: pd.DataFrame) -> None:
+        """Keep the holes of the stored history by name, and say a new one once.
+
+        A hole is known by the two candles around it. One that was not there
+        before is said; one that healed is forgotten. A hole that comes and
+        goes with the source's answers is said once, not on every change. A
+        hole that only became smaller, because the source filled a part of
+        it, is not a new one.
+        """
+        times = frame["time"].to_numpy()
+        holes = {(int(times[i]), int(times[i + 1])) for i in np.nonzero(np.diff(times) > self._step)[0]}
+        now = self._timer()
+        news = [
+            pair
+            for pair in holes - self._holes
+            if not cd.within(pair, self._holes) and now - self._hole_said.get(pair, -math.inf) >= HOLE_QUIET
+        ]
+        self._hole_said = {pair: at for pair, at in self._hole_said.items() if now - at < HOLE_QUIET}
+        self._hole_said.update((pair, now) for pair in holes)
+        self._holes = holes
+        if news:
+            # The source's own history lacks candles.
+            self._alert("warn", "history_gaps", count=len(holes))
+
+    def _forecast(self, frame: pd.DataFrame) -> None:
+        """One forecast per newly closed candle, after everything about signals is done."""
+        if self._forecaster is None:
+            return
+        try:
+            if self._forecaster.update(frame):
+                self._version += 1  # open pages fetch the snapshot again and get the new forecast
+        except Exception:  # the forecast is an extra: it must never cost a cycle
+            log.exception("live feed: the forecast failed")
 
     def _judge_feed(self) -> None:
         reference = self._activity_at if self._activity_at is not None else self._started_at
@@ -523,6 +625,9 @@ class LiveFeed:
             # A rule of thumb for the broker's hours, not its calendar (see pricecheck).
             "market_closed": bool(self._closed_hours(now)),
             "bars": self._bars() if live else {},
+            # Ticks come this often. The page's "server lost" limit follows it, and it must be
+            # known from the tick: a page whose /api/state fails has nothing else.
+            "poll_seconds": self._poll_seconds,
         }
 
     def tick(self) -> dict[str, Any]:
@@ -586,13 +691,25 @@ class LiveFeed:
                 "email": self._notifier.enabled,
                 "utc_offset_hours": self._offset_hours,
                 "alert_after_seconds": self._alert_after,
-                "poll_seconds": self._poll_seconds,  # ticks come this often: the page's "lost" limit follows it
                 "rules": {
                     "status": "experimental",
                     "filters_off": [fl.NEWS_WINDOW],
                     "market_hours": "approximate",
                 },
             }
+
+    def prediction(self) -> dict[str, Any]:
+        """The forecast block of /api/state (docs/WEB.md). Never raises."""
+        if self._forecaster is None:
+            return fcast.unavailable(fcast.NO_MODEL)
+        try:
+            with self._lock:
+                frame = self._candles
+                last = self._last_closed(frame)
+                return self._forecaster.block(self._status, last + self._step if last else None)
+        except Exception:
+            log.exception("live feed: the forecast block failed")
+            return fcast.unavailable(None)
 
     def frame(self) -> pd.DataFrame | None:
         """The candles kept in memory, newest last. Shared, never to be changed by the caller."""

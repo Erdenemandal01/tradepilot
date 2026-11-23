@@ -398,3 +398,109 @@ def test_http_refusal_carries_status_and_retry_after(monkeypatch, status, header
     with pytest.raises(DataSourceError) as info:
         http_mod.get_json("https://api.example.test/x", {})
     assert (info.value.status, info.value.retry_after) == (status, retry_after)
+
+
+# --- older candles in pages (for fitting the forecast) ------------------------------------------
+
+
+class FakeExchange:
+    """A klines endpoint over a fixed list of candle open times: startTime and limit as the exchange reads them."""
+
+    def __init__(self, times: list[int], refuse_on: int | None = None, status: int = 429):
+        self.times = times
+        self.calls: list[dict] = []
+        self.refuse_on, self.status = refuse_on, status
+
+    def __call__(self, url, params):
+        assert url.endswith("/fapi/v1/klines")
+        self.calls.append(dict(params))
+        if self.refuse_on is not None and len(self.calls) >= self.refuse_on:
+            raise DataSourceError("HTTP refused", status=self.status, retry_after=120.0)
+        assert "endTime" not in params
+        since = int(params["startTime"])
+        listed = [t for t in self.times if t * 1000 >= since][: int(params["limit"])]
+        return [kline(t, 4000, 4002, 3999, 4001) for t in listed]
+
+
+def history_source(exchange: FakeExchange) -> tuple[BinanceSource, list[float]]:
+    pauses: list[float] = []
+    return BinanceSource(get_json=exchange, clock=lambda: 0, sleep=pauses.append), pauses
+
+
+def test_binance_history_pages_join_without_gaps_or_duplicates():
+    times = [T0 + i * M15 for i in range(3200)]
+    exchange = FakeExchange(times)
+    source, pauses = history_source(exchange)
+    frame = source.fetch_history("M15")
+
+    assert frame["time"].tolist() == times  # every candle once, in order
+    assert [call["limit"] for call in exchange.calls] == ["1500"] * 3
+    # The first page asks for the oldest candles there are; each later one starts just after the last candle read.
+    assert [call["startTime"] for call in exchange.calls] == [
+        "0", str(times[1499] * 1000 + 1), str(times[2999] * 1000 + 1),
+    ]  # fmt: skip
+    assert exchange.calls[0]["symbol"] == "XAUUSDT" and exchange.calls[0]["interval"] == "15m"
+    assert pauses == [0.5, 0.5]  # a pause before every page but the first
+
+
+def test_binance_history_never_returns_the_forming_candle_as_closed():
+    for count in (1, 700, 1500, 3000, 3200):  # a last page that is short, full, or empty
+        exchange = FakeExchange([T0 + i * M15 for i in range(count)])
+        frame = history_source(exchange)[0].fetch_history("M15")
+        assert len(frame) == count
+        assert frame["closed"].tolist() == [True] * (count - 1) + [False], count
+    assert history_source(FakeExchange([]))[0].fetch_history("M15").empty
+
+
+def test_binance_history_keeps_a_hole_of_the_exchange_as_a_hole():
+    times = [T0 + i * M15 for i in range(1800) if not 1400 <= i < 1600]  # 200 candles the exchange never had
+    frame = history_source(FakeExchange(times))[0].fetch_history("M15")
+    assert frame["time"].tolist() == times
+
+
+def test_binance_history_between_two_times():
+    times = [T0 + i * M15 for i in range(3200)]
+    exchange = FakeExchange(times)
+    frame = history_source(exchange)[0].fetch_history("M15", start=times[100], end=times[1700])
+    assert frame["time"].tolist() == times[100:1701]
+    assert frame["closed"].all()  # the exchange listed a newer candle than the last one kept
+    assert exchange.calls[0]["startTime"] == str(times[100] * 1000) and len(exchange.calls) == 2
+    with pytest.raises(ValueError):
+        history_source(exchange)[0].fetch_history("M15", start=times[5], end=times[4])
+    with pytest.raises(ValueError):
+        history_source(exchange)[0].fetch_history("M7")
+
+
+@pytest.mark.parametrize("status", [418, 429])
+def test_binance_history_stops_at_once_when_the_exchange_refuses(status):
+    exchange = FakeExchange([T0 + i * M15 for i in range(6000)], refuse_on=2, status=status)
+    source, pauses = history_source(exchange)
+    with pytest.raises(DataSourceError) as caught:
+        source.fetch_history("M15")
+    assert caught.value.status == status and caught.value.retry_after == 120.0
+    assert len(exchange.calls) == 2 and pauses == [0.5]  # no retry, no further page
+
+
+def test_binance_history_refuses_a_page_that_goes_back_in_time():
+    class Stuck(FakeExchange):
+        def __call__(self, url, params):
+            self.calls.append(dict(params))
+            return [kline(t, 4000, 4002, 3999, 4001) for t in self.times[:1500]]  # the same page every time
+
+    exchange = Stuck([T0 + i * M15 for i in range(1500)])
+    with pytest.raises(DataSourceError):
+        history_source(exchange)[0].fetch_history("M15")
+    assert len(exchange.calls) == 2
+
+
+def test_csv_history_is_the_file_and_other_sources_say_they_cannot(tmp_path):
+    path = tmp_path / "c.csv"
+    rows = ["time,open,high,low,close"] + [f"{T0 + i * M15},10,12,9,11" for i in range(12)]
+    path.write_text("\n".join(rows), encoding="utf-8")
+    source = CsvSource(path)
+    assert source.fetch_history("M15")["time"].tolist() == [T0 + i * M15 for i in range(12)]
+    part = source.fetch_history("M15", start=T0 + 2 * M15, end=T0 + 5 * M15)
+    assert part["time"].tolist() == [T0 + i * M15 for i in range(2, 6)]
+    assert len(source.fetch_history("H1")) == 3
+    with pytest.raises(NotImplementedError):
+        TwelveDataSource(api_key="k", get_json=FakeHttp({})).fetch_history("M15")

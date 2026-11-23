@@ -38,10 +38,13 @@ PC_AHEAD = 7777.0  # the PC clock is wrong by more than two hours in every test
 SIGNAL_CODES = ("signal", "signal_emailed")
 ALERT_SUBJECT = notify.alert_message("", "", 0, 0)[0]  # how every system alert's subject starts
 
-TICK_KEYS = {"v", "now", "feed", "age", "price", "bid", "ask", "market_closed", "bars", "card"}
+# Changed on purpose (second page review): "poll_seconds" moved from the snapshot's own keys into
+# the tick. The page's "server lost" limit follows it, and a page whose /api/state fails must
+# still know it. The snapshot starts with a tick, so it carries the key as before.
+TICK_KEYS = {"v", "now", "feed", "age", "price", "bid", "ask", "market_closed", "bars", "card", "poll_seconds"}
 SNAPSHOT_KEYS = TICK_KEYS | {
     "symbol", "timeframe", "source", "reasons", "log", "today", "alerts", "email", "utc_offset_hours", "rules",
-    "alert_after_seconds", "poll_seconds",
+    "alert_after_seconds",
 }  # fmt: skip
 ROW_KEYS = {
     "time", "side", "entry", "zone_low", "zone_high", "sl", "tp", "sl_distance", "tp_distance",
@@ -114,6 +117,7 @@ class FakeSource(DataSource):
         self.fails_at_once = False
         self.on_candles: Callable[[], None] | None = None
         self.calls: list[int] = []  # the limit of every candle request
+        self.missing: set[int] = set()  # row numbers this answer lacks (a copy of the source without them)
         self.quotes = 0
         self.quote_left = threading.Event()
 
@@ -121,7 +125,7 @@ class FakeSource(DataSource):
         """All candles that exist so far; the last one is still forming."""
         frame = self.candles.iloc[: self.cursor].reset_index(drop=True).copy()
         frame.loc[frame.index[-1], "closed"] = False
-        return frame
+        return frame.drop(index=[row for row in self.missing if row < self.cursor - 1]).reset_index(drop=True)
 
     def fetch_candles(self, timeframe: str, limit: int = 500) -> pd.DataFrame:
         assert timeframe == "M15"
@@ -133,6 +137,10 @@ class FakeSource(DataSource):
                 assert self.quote_left.wait(timeout=5.0), "the quote request never left"
             raise self.error
         return self.seen().iloc[-limit:].reset_index(drop=True)
+
+    def fetch_history(self, timeframe: str, start: int | None = None, end: int | None = None) -> pd.DataFrame:
+        assert timeframe == "M15"
+        return self.seen()
 
     def fetch_quote(self) -> Quote:
         self.quote_left.set()
@@ -1024,6 +1032,7 @@ def test_snapshot_and_tick_have_the_shape_docs_web_md_promises(make_world):
     assert (snap["symbol"], snap["timeframe"]) == ("XAUUSD", "M15")
     assert snap["source"] == {"name": "fake", "symbol": "XAUTEST"}
     assert snap["email"] is True and snap["utc_offset_hours"] == 8
+    assert tick["poll_seconds"] == snap["poll_seconds"] == 2.0
     # Plan: every signal is "experimental" until a backtest exists, and the news filter is not applied yet.
     assert snap["rules"] == {"status": "experimental", "filters_off": ["NEWS_WINDOW"], "market_hours": "approximate"}
     assert set(snap["card"]) == ROW_KEYS | {"kind", "state"}
@@ -1479,7 +1488,7 @@ def test_any_error_out_of_the_notifier_gives_the_email_failed_alert(make_world):
 
 
 def test_a_hole_in_the_sources_own_history_is_said_once_and_does_not_reload_every_cycle(make_world):
-    holed = UP.drop(UP.index[1380]).reset_index(drop=True)  # the source itself lacks one candle, long ago
+    holed = UP.drop(UP.index[1200]).reset_index(drop=True)  # the source itself lacks one candle, two days ago
     world = make_world(1400, candles=holed)
     world.poll()
     assert world.source.calls == [HISTORY] and codes(world.feed.snapshot())[:2] == ["history_gaps", "started"]
@@ -1489,6 +1498,8 @@ def test_a_hole_in_the_sources_own_history_is_said_once_and_does_not_reload_ever
     world.close_candles()
     world.poll()
     snap = world.feed.snapshot()
+    # Changed on purpose with finding P4 of the second review: the hole moved from 5 hours back to
+    # 2 days back. A hole younger than a day is now asked for once per closed candle (next test).
     assert world.source.calls == [HISTORY] + [live.TAIL] * 6  # tails only: the old hole is not news
     assert snap["feed"] == "ok" and codes(snap).count("history_gaps") == 1 and "reloaded" not in codes(snap)
 
@@ -1541,3 +1552,367 @@ def test_an_error_between_two_cycles_does_not_end_the_loop(make_world, caplog):
     assert len(beats) >= 2 and "between cycles" in caplog.text  # the error was logged, the next beat came
     assert world.source.quotes >= 3 and world.feed.tick()["feed"] == "ok"  # and the source was asked again
 
+
+
+# --- findings of the second review: decisions are kept, holes are known by name -----------------------
+
+
+def sent_then_duplicate(world: World) -> tuple[dict[str, Any], int]:
+    """A BUY decided, announced and emailed on row 1400; row 1401 after it is a DUPLICATE."""
+    world.poll()
+    world.walk_to(1402)
+    assert codes(world.feed.snapshot())[0] == "signal_emailed"
+    sent = world.feed.snapshot()["log"][0]
+    assert sent["time"] == opens_at(1401)
+    world.close_candles()
+    world.poll()
+    assert world.feed.snapshot()["reasons"]["blocked"] == fl.DUPLICATE
+    return sent, len(world.signal_emails())
+
+
+def decided(world: World) -> list[tuple[int | None, str | None, str | None]]:
+    return [(d.result.signal_time, d.result.signal, d.blocked) for d in world.feed._decisions]
+
+
+def test_one_answer_without_a_candle_does_not_rewrite_the_signal_sent_on_it(make_world):
+    world = make_world()
+    sent, emails = sent_then_duplicate(world)
+    before = decided(world)
+
+    world.pass_seconds(2)
+    world.source.missing = {1400}  # one answer from a copy of the source that lacks the signal's candle
+    world.poll()
+    snap = world.feed.snapshot()
+    assert world.source.calls[-2:] == [live.TAIL, HISTORY] and codes(snap)[:2] == ["history_gaps", "reloaded"]
+    assert snap["feed"] == "ok" and decided(world) == before  # the reload decided nothing again
+
+    world.source.missing = set()  # the candle is back
+    world.pass_seconds(2)
+    world.poll()
+    snap = world.feed.snapshot()
+    assert decided(world) == before and world.feed._holes == set()
+    assert snap["log"][0] == {**sent, "outcome": snap["log"][0]["outcome"]} and snap["card"]["time"] == sent["time"]
+    assert snap["reasons"]["blocked"] == fl.DUPLICATE and len(world.signal_emails()) == emails
+
+
+def test_a_copy_that_catches_up_while_the_feed_is_down_does_not_rewrite_a_sent_signal(make_world):
+    world = make_world()
+    sent, emails = sent_then_duplicate(world)
+    before = decided(world)
+
+    world.pass_seconds(100)
+    seen = []
+    for behind in (2, 1, 0):  # two candles behind (a reload), one behind (the tail connects), right
+        world.source.cursor = 1403 - behind
+        world.pass_seconds(2)
+        world.poll()
+        seen.append((world.feed.tick()["feed"], world.source.calls[-1]))
+        assert decided(world) == before
+    assert seen == [("down", HISTORY), ("down", live.TAIL), ("ok", live.TAIL)]
+    snap = world.feed.snapshot()
+    assert snap["log"][0] == {**sent, "outcome": snap["log"][0]["outcome"]} and snap["card"]["time"] == sent["time"]
+    assert len(world.signal_emails()) == emails and not hasattr(world.feed, "_stale_times")
+
+
+def test_a_candle_stopped_for_a_stale_price_stays_stopped_through_later_reloads(make_world):
+    target = signal_cursors(make_world)[-1]
+    world = make_world()
+    world.poll()
+    world.walk_to(target - 1)
+    emails = len(world.signal_emails())
+    frozen = world.source.fetch_quote()
+    world.source.fetch_quote = lambda: (world.source.quote_left.set(), frozen)[1]
+    world.pass_seconds(61)
+    world.poll()
+    world.close_candles()  # the signal candle closes under a price that is a minute old
+    world.poll()
+    stopped = decided(world)[-1]
+    assert stopped == (opens_at(target - 1), "BUY", fl.STALE_FEED)
+    del world.source.fetch_quote
+
+    world.close_candles(4)  # candles are missed: a whole reload, with the feed fine again
+    world.poll()
+    assert world.source.calls[-1] == HISTORY and world.feed.tick()["feed"] == "ok"
+    assert stopped in decided(world) and decided(world)[-5] == stopped  # still stopped, four new ones after it
+    assert opens_at(target - 1) not in log_times(world.feed.snapshot())
+    assert len(world.signal_emails()) <= emails + 1  # at most the newest valid one of the missed candles
+
+
+def test_a_hole_is_known_by_its_place_a_new_one_is_said_and_a_healed_one_forgotten(make_world):
+    world = make_world()
+    world.poll()
+    world.close_candles()
+    world.source.missing = {1399}  # the candle that just closed is not listed
+    world.poll()
+    assert world.source.calls[-2:] == [live.TAIL, HISTORY]
+    assert world.feed._holes == {(opens_at(1398), opens_at(1400))}
+    assert codes(world.feed.snapshot()).count("history_gaps") == 1
+
+    world.source.missing = set()  # two seconds later the source has it: the tail heals the hole
+    world.pass_seconds(2)
+    world.poll()
+    assert world.feed._holes == set() and world.source.calls[-1] == live.TAIL
+
+    world.walk_to(1405)  # more than a minute later
+    world.close_candles()
+    world.source.missing = {1404}  # another hole: as many holes as were said before, but not that one
+    world.poll()
+    snap = world.feed.snapshot()
+    assert world.feed._holes == {(opens_at(1403), opens_at(1405))}
+    assert codes(snap).count("history_gaps") == 2  # said, although the count of holes is 1 as before
+    for _ in range(3):
+        world.pass_seconds(2)
+        world.poll()
+    assert codes(world.feed.snapshot()).count("history_gaps") == 2  # and said once, not on every cycle
+
+
+def test_a_reload_for_missed_candles_does_not_say_an_old_hole_again(make_world):
+    holed = UP.drop(UP.index[[110, 1250]]).reset_index(drop=True)
+    world = make_world(1400, candles=holed)
+    world.poll()
+    assert codes(world.feed.snapshot()).count("history_gaps") == 1 and len(world.feed._holes) == 2
+    world.close_candles(95)  # the older hole leaves the kept candles, and candles were missed
+    world.poll()
+    snap = world.feed.snapshot()
+    assert world.source.calls[-1] == HISTORY and codes(snap).count("reloaded") == 1
+    assert len(world.feed._holes) == 1 and codes(snap).count("history_gaps") == 1  # no new hole: nothing said
+
+
+def test_a_young_hole_that_the_source_fills_later_is_picked_up_when_a_candle_closes(make_world):
+    world = make_world()
+    world.source.missing = {1395}  # not listed for an hour, so it is out of reach of the three-candle tail
+    world.poll()
+    assert world.feed._holes == {(opens_at(1394), opens_at(1396))}
+    world.close_candles()
+    world.poll()
+    # A candle closed and the hole is younger than a day: one longer tail, from the candle before the hole on.
+    assert world.source.calls == [HISTORY, live.TAIL, 7] and len(world.feed._holes) == 1
+
+    world.source.missing = set()  # now the source lists it
+    for _ in range(3):
+        world.pass_seconds(2)
+        world.poll()
+    assert world.source.calls[-3:] == [live.TAIL] * 3 and len(world.feed._holes) == 1  # not on every cycle
+    decisions = len(world.feed._decisions)
+    world.close_candles()
+    world.poll()
+    snap = world.feed.snapshot()
+    frame = world.feed.frame()
+    assert world.source.calls[-2:] == [live.TAIL, 8] and world.source.calls.count(HISTORY) == 1
+    assert world.feed._holes == set() and cd.find_gaps(frame, "M15") == [] and len(frame) == HISTORY
+    assert frame["time"].tolist() == world.source.seen()["time"].tolist()[-HISTORY:]
+    assert "reloaded" not in codes(snap) and snap["feed"] == "ok"
+    assert len(world.feed._decisions) == decisions + 1  # the candle that closed now; the filled one is history
+
+    world.close_candles()
+    world.poll()
+    assert world.source.calls[-1] == live.TAIL  # no hole left: the usual tail again
+
+
+def test_of_two_young_holes_the_longer_tail_reaches_the_older_one_too(make_world):
+    world = make_world()
+    world.source.missing = {1390, 1395}
+    world.poll()
+    assert world.feed._holes == {(opens_at(1389), opens_at(1391)), (opens_at(1394), opens_at(1396))}
+    world.source.missing = {1395}  # the source fills the older hole; the younger one stays
+    world.close_candles()
+    world.poll()
+    # From the candle before the OLDER hole on: rows 1389 to 1400 are 12 candles. A tail that only
+    # reached the younger hole (7 candles) would leave the filled one out for good.
+    assert world.source.calls == [HISTORY, live.TAIL, 12]
+    assert world.feed._holes == {(opens_at(1394), opens_at(1396))}
+    assert opens_at(1390) in world.feed.frame()["time"].tolist() and len(world.feed.frame()) == HISTORY
+    snap = world.feed.snapshot()
+    assert "reloaded" not in codes(snap) and codes(snap).count("history_gaps") == 1 and snap["feed"] == "ok"
+
+
+def test_a_hole_the_source_fills_in_part_is_picked_up_and_is_not_said_as_a_new_hole(make_world):
+    # Inside the usual tail: two candles were not listed, then the newer of them is.
+    world = make_world()
+    world.source.missing = {1396, 1397}
+    world.poll()
+    assert world.feed._holes == {(opens_at(1395), opens_at(1398))}
+    world.source.missing = {1396}
+    world.pass_seconds(2)
+    world.poll()
+    snap = world.feed.snapshot()
+    assert world.source.calls == [HISTORY, live.TAIL]  # no reload: nothing the feed had was lost
+    assert world.feed._holes == {(opens_at(1395), opens_at(1397))} and opens_at(1397) in world.feed.frame()["time"].tolist()
+    assert codes(snap).count("history_gaps") == 1 and "reloaded" not in codes(snap)  # the hole only became smaller
+
+    # Out of the tail's reach: the longer request at the next closed candle brings the part that was filled.
+    world = make_world()
+    world.source.missing = {1390, 1391}
+    world.poll()
+    world.source.missing = {1390}
+    world.close_candles()
+    world.poll()
+    snap = world.feed.snapshot()
+    assert world.source.calls == [HISTORY, live.TAIL, 12]
+    assert world.feed._holes == {(opens_at(1389), opens_at(1391))} and opens_at(1391) in world.feed.frame()["time"].tolist()
+    assert codes(snap).count("history_gaps") == 1 and "reloaded" not in codes(snap)
+    assert world.feed.frame()["time"].tolist() == world.source.seen()["time"].tolist()[-len(world.feed.frame()) :]
+
+
+def test_the_longer_tail_is_used_only_when_it_fits_and_a_failure_costs_nothing(make_world):
+    world = make_world()
+    world.source.missing = {1395}
+    world.poll()
+    hole = {(opens_at(1394), opens_at(1396))}
+    fetch = world.source.fetch_candles
+
+    def longer_tail_fails(timeframe: str, limit: int = 500) -> pd.DataFrame:
+        if limit not in (live.TAIL, HISTORY):
+            world.source.calls.append(limit)
+            raise DataSourceError("the longer request timed out")
+        return fetch(timeframe, limit)
+
+    world.source.fetch_candles = longer_tail_fails
+    world.source.missing = set()  # the source has the candle now
+    world.close_candles()
+    assert world.poll() == 2.0  # the cycle itself is fine
+    snap = world.feed.snapshot()
+    assert world.source.calls[-2:] == [live.TAIL, 7] and world.feed._holes == hole  # nothing gained, nothing lost
+    assert snap["feed"] == "ok" and "reloaded" not in codes(snap)
+    assert world.feed._decisions[-1].result.signal_time == opens_at(1400)  # the closed candle was decided
+
+    def longer_tail_lacks_a_candle(timeframe: str, limit: int = 500) -> pd.DataFrame:
+        frame = fetch(timeframe, limit)
+        if limit not in (live.TAIL, HISTORY):  # this answer opens a hole the stored candles do not have
+            frame = frame[frame["time"] != opens_at(1398)].reset_index(drop=True)
+        return frame
+
+    world.source.fetch_candles = longer_tail_lacks_a_candle
+    world.close_candles()
+    world.poll()
+    assert world.source.calls[-2:] == [live.TAIL, 8] and world.feed._holes == hole  # not used: it would cost a candle
+    assert opens_at(1398) in world.feed.frame()["time"].tolist()
+
+    del world.source.fetch_candles  # the source answers properly: the next closed candle brings the fill
+    world.close_candles()
+    world.poll()
+    assert world.source.calls[-2:] == [live.TAIL, 9] and world.feed._holes == set()
+    assert world.source.calls.count(HISTORY) == 1 and "reloaded" not in codes(world.feed.snapshot())
+
+
+def test_a_refusal_of_the_longer_tail_is_obeyed_after_the_cycle_it_came_in(make_world):
+    world = make_world()
+    world.source.missing = {1395}
+    world.poll()
+    fetch = world.source.fetch_candles
+
+    def refused(timeframe: str, limit: int = 500) -> pd.DataFrame:
+        if limit not in (live.TAIL, HISTORY):
+            world.source.calls.append(limit)
+            raise DataSourceError("HTTP 429", status=429, retry_after=90.0)
+        return fetch(timeframe, limit)
+
+    world.source.fetch_candles = refused
+    world.close_candles()
+    assert world.poll() == 90.0  # the source asked for quiet: the next cycle waits as long as it said
+    # The candle that closed is decided in this very cycle: the usual answers were good.
+    assert world.feed._decisions[-1].result.signal_time == opens_at(1400) and world.feed.tick()["feed"] == "ok"
+    assert world.source.calls[-2:] == [live.TAIL, 7]
+
+    del world.source.fetch_candles
+    world.source.missing = set()  # the source answers again, and lists the candle now
+    world.pass_seconds(90)
+    assert world.poll() == 2.0 and world.source.calls[-1] == live.TAIL  # no candle closed since: the usual tail
+    world.close_candles()
+    assert world.poll() == 2.0 and world.feed._holes == set()  # and the next closed candle brings the fill
+
+
+def test_a_hole_that_comes_and_goes_reloads_the_history_once_a_minute_at_most(make_world):
+    world = make_world()
+    world.poll()
+    world.close_candles()
+    for cycle in range(20):  # two copies of the source answer in turn; one lacks the newest closed candle
+        world.source.missing = {1399} if cycle % 2 == 0 else set()
+        world.poll()
+        world.pass_seconds(2)
+    snap = world.feed.snapshot()
+    assert world.source.calls.count(HISTORY) == 2  # the first load, and one reload for that hole
+    assert codes(snap).count("reloaded") == 1 and codes(snap).count("history_gaps") == 1
+    assert snap["feed"] == "ok" and [d.result.signal_time for d in world.feed._decisions].count(opens_at(1400)) == 1
+
+    world.pass_seconds(30)  # a minute after the reload the same hole may cause one more
+    for cycle in range(6):
+        world.source.missing = {1399} if cycle % 2 == 0 else set()
+        world.poll()
+        world.pass_seconds(2)
+    assert world.source.calls.count(HISTORY) == 3
+    assert codes(world.feed.snapshot()).count("history_gaps") == 1  # the hole itself is still said once
+
+
+def test_after_a_reload_only_candles_a_signal_can_still_live_on_are_announced_whatever_the_clock_says(make_world):
+    target = signal_cursors(make_world)[-1]  # eight candles are missed; the newest of them carries a signal
+    world = make_world(target - 8, stale_after_seconds=10**6)
+    world.source.timed = False  # a quote without a time: the feed has only the PC's clock
+    world.pc.now = world.clock.now - 7800  # and that clock is more than two hours slow
+    world.poll()
+    emails = len(world.signal_emails())
+    before = world.feed.snapshot()
+
+    world.close_candles(8)
+    world.poll()
+    snap = world.feed.snapshot()
+    newest_close = opens_at(world.source.cursor - 1)
+    missed = [row for row in snap["log"] if row["time"] > before["now"] + 7800]
+    still_valid = [row for row in missed if row["time"] > newest_close - 2 * M15]
+    # By the slow clock none of the missed signals has expired, so the clock alone would send them all.
+    assert len(missed) >= 2 and all(snap["now"] < row["expires_at"] for row in missed)
+    assert world.source.calls[-1] == HISTORY and 1 <= len(still_valid) < len(missed)
+    new_emails = world.signal_emails()[emails:]
+    assert len(new_emails) == len(still_valid)
+    assert all(f"{row['entry']:.2f}" in mail[0] for row, mail in zip(reversed(still_valid), new_emails))
+
+
+@pytest.mark.parametrize("behind", [1, 4])
+def test_a_first_answer_from_a_copy_that_is_behind_does_not_announce_what_closed_before_the_start(make_world, behind):
+    target = signal_cursors(make_world)[-1]
+    world = make_world(target + 1, stale_after_seconds=10**6)  # started one candle after a signal's candle closed
+    world.source.cursor -= behind  # the first answer is behind; the clock is right
+    world.poll()
+    assert codes(world.feed.snapshot()) == ["started"]
+    world.source.cursor += behind
+    world.pass_seconds(2)
+    world.poll()
+    snap = world.feed.snapshot()
+    assert world.source.calls[-1] == (live.TAIL if behind == 1 else HISTORY)
+    # The signal is decided and shown, as after any restart. Nobody is told: it closed before the feed started.
+    assert snap["log"][0]["time"] == opens_at(target - 1) and snap["card"]["kind"] == "signal"
+    assert newest_signal(snap) == 0 and world.signal_emails() == []
+
+    world.until_signal()  # the next one is announced as usual
+    assert len(world.signal_emails()) == 1
+
+
+@pytest.mark.parametrize("poll", [0.5, 2.0, 15.0, 60.0])
+def test_every_tick_says_how_often_ticks_come(make_world, poll):
+    """The page calls the server lost after a few poll intervals without a tick. It must know the
+    interval from the tick itself: a page whose /api/state keeps failing has nothing else."""
+    world = make_world(poll_seconds=poll)
+    before = world.feed.tick()  # before the first cycle: a page that connects while the feed starts
+    world.poll()
+    after = world.feed.tick()
+    world.source.error = DataSourceError("no route to host")
+    world.pass_seconds(120)
+    world.poll()
+    down = world.feed.tick()  # and while the feed is down
+    assert down["feed"] == "down"
+    for tick in (before, after, down, world.feed.snapshot()):
+        assert tick["poll_seconds"] == poll and type(tick["poll_seconds"]) is float
+
+
+@pytest.mark.parametrize("poll, late_after", [(2.0, 10.0), (15.0, 37.5), (30.0, 45.0), (100.0, 45.0)])
+def test_late_comes_before_down_also_with_a_slow_poll(make_world, poll, late_after):
+    world = make_world(poll_seconds=poll)
+    world.poll()
+    start = world.timer.now
+    world.source.error = DataSourceError("no route to host")
+    seen = []
+    for seconds in (late_after - 0.5, late_after, 59.5, 60):
+        world.timer.now = start + seconds
+        world.poll()
+        seen.append(world.feed.tick()["feed"])
+    assert seen == ["ok", "late", "late", "down"]

@@ -29,7 +29,9 @@
   const SILENT_STREAM_MS = 120000; // an "open" stream that stays silent this long is opened again
   const CANDLE_LIMIT = 1500;
   const CANDLE_PAUSE_MS = 3000;
-  const SNAPSHOT_PAUSE_MS = 5000; // after a failed /api/state
+  const SNAPSHOT_PAUSE_MS = 5000; // after a failed /api/state: asked again this much later
+  const SNAPSHOT_FAILS_SHOWN = 3; // this many failed in a row: the page says so
+  const ALERT_FLAG_MS = 60000; // how long "the feed is back" stays in the tab title
   const TAIL_BARS = 3; // newest candles asked for when the tick does not carry the chart's timeframe
   const TAIL_EVERY_MS = 1500;
   const TAIL_FAILS_SHOWN = 3;
@@ -65,6 +67,7 @@
     notify: 'tradepilot.notify',
     sound: 'tradepilot.sound',
     signal: 'tradepilot.lastSignal',
+    broken: 'tradepilot.notifyBroken', // '1': this browser granted notifications and could not show one
     tf: 'tradepilot.chart.timeframe',
     favorites: 'tradepilot.chart.favorites',
   };
@@ -81,6 +84,20 @@
     upSoft: 'rgba(45, 212, 191, 0.16)', // the body of a candle that is still forming
     downSoft: 'rgba(251, 113, 133, 0.16)',
   };
+  // The forecast: the line and its band, full and dimmed. Dimmed is for a model whose
+  // measured record is no better than "the price stays where it is".
+  const FORECAST_COLOR = {
+    line: '#F472B6',
+    band: 'rgba(244, 114, 182, 0.40)',
+    lineDim: 'rgba(244, 114, 182, 0.70)', // dimmer than the full line, still clearer than its band
+    bandDim: 'rgba(244, 114, 182, 0.22)',
+  };
+  const FORECAST_TF = 'M15'; // the forecast exists on this timeframe only and is never converted
+  const FORECAST_LATE_S = 120; // a forecast whose next candle is this long overdue is not shown
+  const FORECAST_POINTS = 4; // the contract (docs/WEB.md): one point for each of the next four candles
+  const FORECAST_FAR = 0.2; // a point further from the base price than this share of it: a broken block
+  const FORECAST_SCOPE = 'open_market'; // the one kind of record this page has words for
+  const MAX_TIME = 4102444800; // 2100-01-01: no real time lies beyond it (the server's own limit)
 
   const CONDITIONS = {
     trend_ema200: { long: 'Урт хугацааны чиг (EMA200)', short: 'EMA200' },
@@ -124,6 +141,7 @@
     lostSince: 0,
     reconnecting: false, // the stream reported an error and has not delivered since
     leaving: false,
+    leaveTimer: null, // the pause before the page leaves for the login page (goLogin)
     statusKind: null,
   };
 
@@ -139,6 +157,7 @@
     alertsKey: null,
     flagKey: null,
     chartNoteKey: null,
+    forecastKey: null,
   };
 
   const chart = {
@@ -166,11 +185,15 @@
     linesKey: '',
     levels: null, // {min, max} of the price lines, kept inside the visible price range
     hover: null,
+    forecast: null, // {line, low, high, slots, label}: the forecast's series and its label on the chart
+    forecastKey: '', // what the three drawn series hold now; '' when they are empty
+    slotsKey: '', // which future candles the time axis reaches to; '' when none
   };
 
   const stream = { source: null, broken: false, timer: null, delay: 2000, restartedAt: 0 };
 
-  const snapshotJob = { busy: false, queued: false, retryAt: 0 };
+  // fails: /api/state requests failed in a row; timer: the retry after a failed one
+  const snapshotJob = { busy: false, queued: false, retryAt: 0, fails: 0, timer: null };
 
   const notif = {
     enabled: readStore(STORE.notify) !== '0',
@@ -181,9 +204,11 @@
     lastAlert: 0,
     audio: null,
     titleBase: document.title,
-    titleFlag: null,
-    titleSignal: null, // the signal a title flag belongs to; null for a flag that is not about a signal
-    broken: false, // the browser allowed notifications and then refused to show one
+    signalFlag: null, // {text, time, until}: a new signal's word for the tab title, until it expires
+    alertFlag: null, // {text, down, wall, mono}: a feed alert's word for the tab title
+    // The browser allowed notifications and then refused to show one. Kept across visits:
+    // otherwise the button would say "on" again until the next signal was missed.
+    broken: readStore(STORE.broken) === '1',
     lostSaid: false,
   };
 
@@ -513,7 +538,8 @@
       );
       beep('alert');
     });
-    window.setTimeout(function () {
+    state.leaveTimer = window.setTimeout(function () {
+      state.leaveTimer = null;
       window.location.assign('/login?expired=1');
     }, LEAVE_AFTER_MS);
   }
@@ -578,11 +604,16 @@
       return;
     }
     snapshotJob.busy = true;
+    if (snapshotJob.timer !== null) {
+      window.clearTimeout(snapshotJob.timer);
+      snapshotJob.timer = null;
+    }
     try {
       for (let round = 0; round < 2; round += 1) {
         snapshotJob.queued = false;
         const snap = await getJSON('/api/state');
         snapshotJob.retryAt = 0;
+        snapshotJob.fails = 0;
         applySnapshot(snap);
         if (!snapshotJob.queued || !state.tick || state.tick.v === state.snapV) {
           break;
@@ -590,13 +621,26 @@
       }
     } catch (error) {
       snapshotJob.retryAt = Date.now() + SNAPSHOT_PAUSE_MS; // the ticks ask again, but not every two seconds
-      if (!(error instanceof AuthError) && window.console && console.warn) {
-        console.warn('snapshot:', error);
+      if (!(error instanceof AuthError)) {
+        snapshotJob.fails += 1;
+        if (window.console && console.warn) {
+          console.warn('snapshot:', error);
+        }
       }
     } finally {
       snapshotJob.busy = false;
       snapshotJob.queued = false;
     }
+    if (snapshotJob.fails > 0 && !state.leaving) {
+      // Asked again by a timer, not by the next tick: with a slow poll that tick is far away,
+      // and without a stream it never comes.
+      snapshotJob.timer = window.setTimeout(function () {
+        snapshotJob.timer = null;
+        refreshSnapshot();
+      }, SNAPSHOT_PAUSE_MS);
+      safe(checkTickSignal); // no snapshot to be had: a new signal is announced from the tick's own card
+    }
+    safe(renderCardNotes); // says so after a few failures in a row, and stops saying so after a success
   }
 
   function applySnapshot(snap) {
@@ -654,6 +698,7 @@
       applyBars(tick.bars);
     });
     safe(syncPriceLines);
+    safe(syncForecast); // a candle may have closed: the forecast made before it must go
   }
 
   function onTick(tick) {
@@ -664,6 +709,7 @@
     if (tick.v !== state.snapV && Date.now() >= snapshotJob.retryAt) {
       refreshSnapshot(); // the snapshot changed: reasons, log, tiles, alerts, markers
     }
+    safe(checkTickSignal);
   }
 
   // The stream. EventSource reconnects by itself; a new one is made only when the old one is closed.
@@ -774,7 +820,13 @@
 
   /* Ticks come once per poll interval, so "no tick" means lost only after a few of those. */
   function lostAfterMs() {
-    const poll = state.snap && isNum(state.snap.poll_seconds) ? state.snap.poll_seconds : 0;
+    // The interval comes with every tick, so the limit is right even when no snapshot could be had.
+    let poll = 0;
+    if (state.tick && isNum(state.tick.poll_seconds)) {
+      poll = state.tick.poll_seconds;
+    } else if (state.snap && isNum(state.snap.poll_seconds)) {
+      poll = state.snap.poll_seconds;
+    }
     return Math.max(LOST_AFTER_MS, 3 * poll * 1000);
   }
 
@@ -788,6 +840,7 @@
       } else {
         safe(renderStatus); // the seconds in the pill keep counting
       }
+      safe(syncForecast); // no forecast is shown over candles that no longer move
       if (state.tick && !notif.lostSaid && Date.now() - state.lostSince > NOTIFY_LOST_AFTER_MS) {
         notif.lostSaid = true;
         pushNotice(
@@ -812,6 +865,7 @@
       requestCandles(); // a load of the candles failed: keep trying
     }
     safe(renderClock);
+    safe(paintTitle); // a flag in the tab title ends by the clock, with or without ticks
   }
 
   // ------------------------------------------------------- live parts (ticks)
@@ -822,7 +876,7 @@
     safe(renderPrice);
     safe(renderCard);
     safe(renderChartNote);
-    safe(expireTitleFlag);
+    safe(paintTitle);
   }
 
   function renderStatus() {
@@ -1491,12 +1545,21 @@
     const stale = state.lost && tick !== null;
     const closed = tick !== null && tick.market_closed === true;
     const since = stale ? fmtStamp(tick.now, estimatedNow()) : '';
-    const key = [stale ? 1 : 0, closed ? 1 : 0, since].join('|');
+    // Ticks arrive but /api/state keeps failing: the card and the price are current, the rest is not.
+    const behind = !stale && tick !== null && snapshotJob.fails >= SNAPSHOT_FAILS_SHOWN;
+    const key = [stale ? 1 : 0, closed ? 1 : 0, since, behind ? 1 : 0].join('|');
     if (key === view.notesKey) {
       return;
     }
     view.notesKey = key;
     const nodes = [];
+    if (behind) {
+      const words =
+        'Серверээс бүрэн мэдээлэл авч чадахгүй байна. Сигналын түүх, шалтгаан, мэдэгдлийн жагсаалт ' +
+        'шинэчлэгдээгүй байж магадгүй. Хуудас өөрөө дахин оролдож байна.';
+      nodes.push(noteNode('down', 'warn', words));
+      announce(words);
+    }
     if (stale) {
       nodes.push(
         noteNode(
@@ -1524,7 +1587,7 @@
   function renderSnapshotParts() {
     safe(renderSource);
     safe(syncSupported);
-    safe(renderForecast);
+    safe(syncForecast);
     safe(renderToday);
     safe(renderRules);
     safe(renderReasons);
@@ -1894,6 +1957,9 @@
       });
       chart.markers = LWC.createSeriesMarkers(chart.series, []);
       chart.api.subscribeCrosshairMove(onCrosshair);
+      safe(function () {
+        initForecastSeries(LWC);
+      });
     } catch (error) {
       chart.api = null;
       chart.series = null;
@@ -1914,7 +1980,8 @@
     const token = ++chart.request;
     chart.loading = true;
     chart.startedAt = Date.now();
-    chart.stale = false; // this load answers every gap seen so far
+    // chart.stale stays as it is until this load has succeeded (setBars). Cleared here, a load
+    // that is slow or fails would pass for a chart in order until its answer came.
     try {
       const body = await getJSON('/api/candles?timeframe=' + encodeURIComponent(tf) + '&limit=' + CANDLE_LIMIT);
       if (token !== chart.request) {
@@ -1971,6 +2038,7 @@
   }
 
   function setBars(tf, bars, resetView) {
+    chart.stale = false; // a fresh load answers every gap seen so far
     chart.shift = state.offset * 3600;
     chart.bars = bars;
     chart.index = new Map();
@@ -1981,6 +2049,7 @@
     chart.last[tf] = bars.length ? bars[bars.length - 1].time : null;
     chart.hover = null;
     chart.series.setData(bars.map(chartBar));
+    safe(syncForecastSlots); // before the view is reset: the time axis is complete then
     if (resetView && bars.length) {
       chart.api.timeScale().resetTimeScale(); // the newest candles at the default zoom
     }
@@ -1993,6 +2062,7 @@
     );
     updateMarkers();
     renderLegend();
+    safe(syncForecast);
   }
 
   function rememberBar(bar) {
@@ -2474,14 +2544,453 @@
     }
   }
 
+  // ----------------------------------------------------------------- forecast
+
   /*
-   * The forecast has a place on the chart (a pink dashed line over the next candles of the
-   * signal timeframe) but nothing in the project produces one. The page says so and never
-   * draws a line of its own making.
+   * The forecast (snapshot.prediction, docs/WEB.md): the expected close of the next four M15
+   * candles, drawn as a pink dashed line with a faint band. It is shown beside the signals
+   * and is never part of one: nothing here touches the signal card, the notification, the
+   * sound or the tab title.
+   *
+   * Rules kept here:
+   * - The page draws only what the server sent. It never makes, moves or stretches a line.
+   * - Only on the M15 chart. On another timeframe nothing is converted and nothing is drawn.
+   * - Only while the forecast fits the candles on screen: it must have been made on the close
+   *   of the newest closed candle. When a newer candle closes the old line goes at once, and
+   *   the new one comes with the next snapshot.
+   * - Never without its measured record. When that record is no better than "the price
+   *   stays where it is", the line is dimmer and the words say so.
    */
-  function renderForecast() {
-    const info = state.snap && state.snap.prediction;
-    setText($('forecast-state'), info && info.available === true ? 'Таамаг' : 'Таамаг бэлэн биш');
+
+  const FORECAST_WHY = {
+    loading: 'ачаалж байна',
+    chart: 'график ачаалж байна',
+    lost: 'сервертэй холбоо тасарсан',
+    feed_down: 'ханш тасарсан',
+    no_model: 'модель хараахан сургагдаагүй',
+    not_enough_candles: 'лаа хүрэлцэхгүй байна',
+    failed: 'тооцоолж чадсангүй',
+    waiting: 'шинэ лааны таамгийг хүлээж байна',
+  };
+  const FORECAST_MORE = {
+    no_model: ' Сургах тушаал: python -m backend.scripts.train_forecast. Дараа нь вэб аппыг дахин асаана.',
+    not_enough_candles: ' Таамаг гаргахад урт, тасралтгүй M15 түүх хэрэгтэй.',
+    feed_down: ' Ханш сэргэхэд таамаг дахин гарна.',
+  };
+  const DIRECTION_WORDS = { up: 'өсөх', down: 'буурах', flat: 'тодорхойгүй' };
+
+  /*
+   * The forecast's series. None of them carries a price label, a price line or a crosshair
+   * dot, and none takes part in the price scale: the candles alone decide what range is in
+   * view, so a forecast can never squeeze them.
+   */
+  function initForecastSeries(LWC) {
+    const base = {
+      priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+      priceLineVisible: false, // no line across the chart that could be read as a level
+      lastValueVisible: false, // no label on the price axis that could be read as the live price
+      crosshairMarkerVisible: false,
+      pointMarkersVisible: false,
+      autoscaleInfoProvider: function () {
+        return null;
+      },
+    };
+    const band = Object.assign({}, base, { color: FORECAST_COLOR.band, lineWidth: 1, lineStyle: LWC.LineStyle.Solid });
+    // The four expected closes are dots joined by the dashed line: at the default zoom the
+    // line is only four candles long, and dashes alone are easy to miss.
+    const line = Object.assign({}, base, {
+      color: FORECAST_COLOR.line,
+      lineWidth: 2,
+      lineStyle: LWC.LineStyle.Dashed,
+      pointMarkersVisible: true,
+      pointMarkersRadius: 2.5,
+    });
+    chart.forecast = {
+      // Never drawn. It only keeps the time axis four candles ahead (syncForecastSlots).
+      slots: chart.api.addSeries(LWC.LineSeries, Object.assign({}, base, { visible: false })),
+      low: chart.api.addSeries(LWC.LineSeries, band),
+      high: chart.api.addSeries(LWC.LineSeries, band),
+      line: chart.api.addSeries(LWC.LineSeries, line),
+      label: null,
+    };
+    // The word on the chart itself, at the end of the line. A dot and a word, not an arrow: not a signal.
+    chart.forecast.label = LWC.createSeriesMarkers(chart.forecast.line, [], { autoScale: false });
+  }
+
+  /* Open times of the candles a forecast made now is about: the forming candle and the three after it. */
+  function forecastSlots() {
+    if (chart.tf !== FORECAST_TF || chart.loadedTf !== FORECAST_TF || chart.bars.length === 0) {
+      return null;
+    }
+    const last = chart.bars[chart.bars.length - 1];
+    const first = last.closed === false ? last.time : last.time + STEP[FORECAST_TF];
+    const out = [];
+    for (let i = 0; i < FORECAST_POINTS; i += 1) {
+      out.push(first + i * STEP[FORECAST_TF]);
+    }
+    return out;
+  }
+
+  /*
+   * On the M15 chart the time axis always reaches to the end of those four candles, with a
+   * forecast or without one. So drawing a forecast, or taking it away, adds no time to the
+   * axis and removes none, and the candles stay where they are. Without this the chart
+   * jumped three candles sideways each time. The values of this series are never drawn and
+   * never read: it is not visible and has no part in the price scale.
+   */
+  function syncForecastSlots() {
+    if (!chart.forecast) {
+      return;
+    }
+    const slots = forecastSlots();
+    const key = slots === null ? '' : chart.shift + '|' + slots[0];
+    if (key === chart.slotsKey) {
+      return;
+    }
+    chart.forecast.slots.setData(
+      slots === null
+        ? []
+        : slots.map(function (time) {
+            return { time: toChartTime(time), value: 0 };
+          })
+    );
+    chart.slotsKey = key;
+  }
+
+  /*
+   * The measured record, or null when a part of it is missing or cannot be true: then nothing
+   * is shown as a forecast. The server refuses such a record too (backend/app/forecast.py);
+   * the page checks again, because it prints these numbers under the line.
+   */
+  function forecastSkill(skill) {
+    if (!skill || typeof skill !== 'object' || typeof skill.better_than_baseline !== 'boolean') {
+      return null;
+    }
+    for (const name of ['samples', 'calls', 'calls_up', 'calls_down', 'train_rows']) {
+      if (!Number.isInteger(skill[name]) || skill[name] < 0) {
+        return null;
+      }
+    }
+    for (const name of ['hit_rate', 'coverage', 'hit_rate_baseline']) {
+      if (!isNum(skill[name]) || skill[name] < 0 || skill[name] > 1) {
+        return null;
+      }
+    }
+    for (const name of ['mae', 'baseline_mae']) {
+      if (!isNum(skill[name]) || skill[name] < 0) {
+        return null;
+      }
+    }
+    if (skill.samples === 0 || skill.train_rows === 0 || skill.calls > skill.samples || skill.calls_up + skill.calls_down !== skill.calls) {
+      return null;
+    }
+    if (!isNum(skill.from) || !isNum(skill.to) || !(skill.from > 0 && skill.from <= skill.to && skill.to < MAX_TIME)) {
+      return null;
+    }
+    if (skill.scope !== FORECAST_SCOPE || (skill.hit_rate_baseline_call !== 'up' && skill.hit_rate_baseline_call !== 'down')) {
+      return null;
+    }
+    if (skill.better_than_baseline && !(skill.mae < skill.baseline_mae && skill.calls > 0 && skill.hit_rate > 0.5)) {
+      return null; // it claims an edge that its own numbers do not show
+    }
+    return skill;
+  }
+
+  /*
+   * Whether an available block has the contract's shape: four points on the next four candles,
+   * the band around the line, everything near the base price, a probability that is one, and a
+   * direction word that agrees with the probability and with the line.
+   */
+  function forecastShape(p) {
+    if (p.timeframe !== FORECAST_TF || p.horizon_candles !== FORECAST_POINTS || !isNum(p.made_at)) {
+      return false;
+    }
+    if (!isNum(p.base_price) || !(p.base_price > 0) || !isNum(p.up_probability) || p.up_probability < 0 || p.up_probability > 1) {
+      return false;
+    }
+    if (pick(DIRECTION_WORDS, p.direction) === undefined || !Array.isArray(p.points) || p.points.length !== FORECAST_POINTS) {
+      return false;
+    }
+    const far = FORECAST_FAR * p.base_price;
+    let time = p.made_at; // the first point is the candle that opened when the forecast was made
+    for (const point of p.points) {
+      if (!point || typeof point !== 'object' || point.time !== time) {
+        return false;
+      }
+      if (!isNum(point.close) || !isNum(point.low) || !isNum(point.high) || point.low > point.close || point.close > point.high) {
+        return false;
+      }
+      if (p.base_price - point.low > far || point.high - p.base_price > far) {
+        return false;
+      }
+      time += STEP[FORECAST_TF];
+    }
+    const end = p.points[p.points.length - 1].close;
+    if (p.direction === 'up' && !(p.up_probability > 0.5 && end > p.base_price)) {
+      return false;
+    }
+    if (p.direction === 'down' && !(p.up_probability < 0.5 && end < p.base_price)) {
+      return false;
+    }
+    return true;
+  }
+
+  /*
+   * What to show now: {kind: 'drawn', p, skill}, {kind: 'other_tf'}, or {kind: 'off', why, skill}.
+   * Every reason to show nothing is checked here, so a line can never outlive its moment.
+   */
+  function forecastView() {
+    const p = state.snap && state.snap.prediction;
+    const skill = p && typeof p === 'object' ? forecastSkill(p.skill) : null;
+    const off = function (why) {
+      return { kind: 'off', why: why, skill: skill };
+    };
+    if (!state.snap) {
+      return off('loading');
+    }
+    if (chart.tf !== FORECAST_TF) {
+      return { kind: 'other_tf' };
+    }
+    if (state.lost) {
+      return off('lost');
+    }
+    if (state.tick && state.tick.feed === 'down') {
+      return off('feed_down');
+    }
+    if (!p || typeof p !== 'object' || p.available !== true) {
+      const reason = p && typeof p === 'object' ? p.reason : null;
+      return off(reason === 'no_model' || reason === 'not_enough_candles' || reason === 'feed_down' ? reason : 'failed');
+    }
+    if (skill === null || !forecastShape(p) || state.timeframe !== FORECAST_TF) {
+      return off('failed'); // no record or a broken block: not a forecast this page may show
+    }
+    if (!chart.series || !chart.forecast || chart.loadedTf !== FORECAST_TF || chart.bars.length === 0) {
+      return off('chart');
+    }
+    if (chart.stale) {
+      return off('waiting'); // a candle on screen missed its close: the candles are loaded again first
+    }
+    // The forecast must have been made on the close of the newest closed candle on screen.
+    const bars = chart.bars;
+    const last = bars[bars.length - 1];
+    const closed = last.closed === false ? bars[bars.length - 2] : last;
+    if (!closed || closed.closed === false || closed.time + STEP[FORECAST_TF] !== p.made_at) {
+      return off('waiting');
+    }
+    if (last.closed === false && last.time !== p.made_at) {
+      return off('waiting');
+    }
+    const now = estimatedNow();
+    if (now !== null && now > p.made_at + STEP[FORECAST_TF] + FORECAST_LATE_S) {
+      return off('waiting'); // the next candle is long overdue: this forecast belongs to the past
+    }
+    return { kind: 'drawn', p: p, skill: skill };
+  }
+
+  function clearForecastSeries() {
+    if (!chart.forecast || chart.forecastKey === '') {
+      return;
+    }
+    chart.forecastKey = '';
+    chart.forecast.label.setMarkers([]);
+    chart.forecast.line.setData([]);
+    chart.forecast.low.setData([]);
+    chart.forecast.high.setData([]);
+  }
+
+  function drawForecastSeries(p, dim) {
+    const parts = [chart.shift, dim ? 1 : 0, p.made_at, p.base_price];
+    for (const point of p.points) {
+      parts.push(point.time, point.close, point.low, point.high);
+    }
+    const key = parts.join('|');
+    if (key === chart.forecastKey) {
+      return;
+    }
+    // All three start on the last closed candle's close, the price the forecast was made from.
+    const start = toChartTime(p.made_at - STEP[FORECAST_TF]);
+    const line = [{ time: start, value: p.base_price }];
+    const low = [{ time: start, value: p.base_price }];
+    const high = [{ time: start, value: p.base_price }];
+    for (const point of p.points) {
+      const time = toChartTime(point.time);
+      line.push({ time: time, value: point.close });
+      low.push({ time: time, value: point.low });
+      high.push({ time: time, value: point.high });
+    }
+    chart.forecast.line.applyOptions({ color: dim ? FORECAST_COLOR.lineDim : FORECAST_COLOR.line });
+    chart.forecast.low.applyOptions({ color: dim ? FORECAST_COLOR.bandDim : FORECAST_COLOR.band });
+    chart.forecast.high.applyOptions({ color: dim ? FORECAST_COLOR.bandDim : FORECAST_COLOR.band });
+    chart.forecast.line.setData(line);
+    chart.forecast.low.setData(low);
+    chart.forecast.high.setData(high);
+    const end = p.points[p.points.length - 1];
+    chart.forecast.label.setMarkers([
+      {
+        time: toChartTime(end.time),
+        position: end.close < p.base_price ? 'belowBar' : 'aboveBar', // on the side the line does not come from
+        shape: 'circle',
+        size: 0.5,
+        color: dim ? FORECAST_COLOR.lineDim : FORECAST_COLOR.line,
+        text: 'Таамаг',
+      },
+    ]);
+    chart.forecastKey = key;
+  }
+
+  function fmtDate(seconds) {
+    return shifted(seconds).getUTCFullYear() + '.' + fmtDay(seconds);
+  }
+
+  function fmtPercent(share) {
+    return (share * 100).toFixed(1) + '%';
+  }
+
+  function fmtCount(value) {
+    return String(Math.round(value)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+
+  /*
+   * The measured record in words: the numbers of the walk-forward test, as the server sent
+   * them. It says which hours were measured (the broker's open hours, by the rule of thumb),
+   * and sets the hit rate beside what one constant call would have scored on the same calls.
+   */
+  function forecastRecordText(skill) {
+    let calls = 'чиглэл хэлсэн таамаг нэг ч байгаагүй тул чиглэлийн үг хэр оновчтойг хэмжиж чадаагүй';
+    if (skill.calls > 0) {
+      const constant = skill.hit_rate_baseline_call === 'up' ? 'өсөх' : 'буурах';
+      calls =
+        'чиглэл хэлсэн ' + fmtCount(skill.calls) + ' таамгаас (өсөх ' + fmtCount(skill.calls_up) +
+        ', буурах ' + fmtCount(skill.calls_down) + ') ' + fmtPercent(skill.hit_rate) +
+        ' нь зөв байсан; тэр бүгдэд «' + constant + '» гэж хэлсэн бол ' + fmtPercent(skill.hit_rate_baseline) +
+        ' нь зөв байх байсан';
+    }
+    // Two decimals as for prices; one or two more when the two errors would otherwise read the same.
+    let digits = 2;
+    while (digits < 4 && skill.mae !== skill.baseline_mae && skill.mae.toFixed(digits) === skill.baseline_mae.toFixed(digits)) {
+      digits += 1;
+    }
+    return (
+      'Туршилтын бүртгэл (' + fmtDate(skill.from) + ' ' + EN_DASH + ' ' + fmtDate(skill.to) +
+      '). Модель урьд нь хараагүй ' + fmtCount(skill.samples) +
+      ' лаан дээр, зөвхөн брокерын зах зээл нээлттэй гэж тооцсон цагт (ойролцоо цагийн хуваарь) хэмжсэн: ' + calls +
+      '. 60 минутын дараах хаалтын дундаж алдаа ' + skill.mae.toFixed(digits) +
+      '; «ханш байрандаа үлдэнэ» гэж үзэхэд ' + skill.baseline_mae.toFixed(digits) +
+      '. Зурваст бодит хаалтын ' + fmtPercent(skill.coverage) + ' багтсан.'
+    );
+  }
+
+  function forecastNodes(shown) {
+    const nodes = [];
+    if (shown.kind === 'other_tf') {
+      nodes.push(el('p', 'forecast-line', 'Таамаг зөвхөн M15 дээр харагдана. Өөр хугацаанд хөрвүүлж зурдаггүй.'));
+      return nodes;
+    }
+    const skill = shown.skill;
+    if (shown.kind === 'drawn') {
+      const p = shown.p;
+      const end = p.points[p.points.length - 1];
+      const now = estimatedNow();
+      const main = el('p', 'forecast-line');
+      main.append(
+        'Чиглэл: ',
+        el('strong', 'forecast-word', DIRECTION_WORDS[p.direction]),
+        ' · өсөх магадлал ' + fmtPercent(p.up_probability) +
+          (p.direction === 'flat' ? ' (зоос шидэхтэй ойролцоо тул чиглэл хэлэхгүй)' : '') +
+          '. 60 минутын дараа, ' + fmtStamp(end.time + STEP[FORECAST_TF], now) + '-д хаагдах лааны хаалт: ',
+        el('strong', 'forecast-num', fmtPrice(end.close)),
+        ' орчим, зурвас ' + fmtPrice(end.low) + ' ' + EN_DASH + ' ' + fmtPrice(end.high) +
+          ' (10 тохиолдлын 8-д хаалт энд багтахаар тооцсон). Суурь: ' + fmtStamp(p.made_at, now) +
+          '-д хаагдсан лааны хаалт ' + fmtPrice(p.base_price) + '.'
+      );
+      nodes.push(main);
+    } else {
+      nodes.push(
+        el('p', 'forecast-line', 'Таамаг бэлэн биш: ' + FORECAST_WHY[shown.why] + '.' + (pick(FORECAST_MORE, shown.why) || ''))
+      );
+    }
+    if (skill) {
+      nodes.push(el('p', 'forecast-line forecast-record', forecastRecordText(skill)));
+      if (shown.kind === 'drawn' && shown.p.direction !== 'flat' && skill.calls === 0) {
+        // The shown model can say a direction although no scored forecast ever did.
+        nodes.push(
+          noteNode(
+            'warn',
+            'warn',
+            'Одоогийн «' + DIRECTION_WORDS[shown.p.direction] + '» гэсэн үг туршилтаар шалгагдаагүй: ' +
+              'туршилтын үед модель чиглэл нэг ч удаа хэлээгүй. Энэ үгэнд найдах үндэслэл алга.'
+          )
+        );
+      }
+      if (!skill.better_than_baseline) {
+        nodes.push(
+          noteNode(
+            'warn',
+            'warn',
+            'Туршилтаар энэ таамаг «ханш байрандаа үлдэнэ» гэж үзсэнээс илүү байгаагүй.' +
+              (shown.kind === 'drawn' ? ' Тиймээс шугамыг бүдэг зурсан.' : '') +
+              ' Үүнд тулгуурлаж шийдвэр гаргах хэрэггүй.'
+          )
+        );
+      } else {
+        nodes.push(
+          el(
+            'p',
+            'forecast-line',
+            'Туршилтаар энэ таамаг «ханш байрандаа үлдэнэ» гэж үзсэнээс бага алдаатай байсан. Цаашид ч тийм байх баталгаа биш.'
+          )
+        );
+      }
+    }
+    return nodes;
+  }
+
+  /* The line on the chart, the legend entry and the words under the chart, all from one decision. */
+  function syncForecast() {
+    safe(syncForecastSlots);
+    const shown = forecastView();
+    const drawn = shown.kind === 'drawn';
+    const dim = drawn && !shown.skill.better_than_baseline;
+    safe(function () {
+      if (drawn) {
+        drawForecastSeries(shown.p, dim);
+      } else {
+        clearForecastSeries();
+      }
+    });
+
+    let legend = 'Таамаг бэлэн биш';
+    if (shown.kind === 'other_tf') {
+      legend = 'Таамаг зөвхөн M15 дээр харагдана';
+    } else if (drawn) {
+      legend = dim ? 'Таамаг (туршилтаар давуу тал гараагүй)' : 'Таамаг (туршилтын)';
+    } else {
+      legend += ': ' + FORECAST_WHY[shown.why];
+    }
+    setText($('forecast-state'), legend);
+    const swatch = $('forecast-swatch');
+    if (swatch) {
+      swatch.classList.toggle('is-dim', dim);
+      swatch.classList.toggle('is-off', !drawn);
+    }
+
+    const body = $('forecast-body');
+    if (!body) {
+      return;
+    }
+    const now = estimatedNow();
+    const key = JSON.stringify([
+      shown.kind,
+      shown.why || '',
+      drawn ? shown.p : null,
+      shown.skill || null,
+      state.offset,
+      now === null ? '' : dayIndex(now),
+    ]);
+    if (key !== view.forecastKey) {
+      view.forecastKey = key;
+      body.replaceChildren.apply(body, forecastNodes(shown));
+    }
   }
 
   function pickTimeframe(tf) {
@@ -2510,6 +3019,7 @@
       chartMessage('График ачаалж байна');
       loadCandles(true);
     }
+    safe(syncForecast); // another timeframe, or M15 not loaded yet: no line until it fits again
   }
 
   // ------------------------------------------------------------ notifications
@@ -2620,6 +3130,12 @@
     }
     try {
       const notice = new window.Notification(title, { body: body, tag: tag, icon: '/static/favicon.svg', lang: 'mn' });
+      if (notif.broken) {
+        // It works after all (another browser version, a setting changed): forget the mark.
+        notif.broken = false;
+        writeStore(STORE.broken, '0');
+        safe(renderNotifyButton);
+      }
       notice.onclick = function () {
         try {
           window.focus();
@@ -2640,6 +3156,7 @@
       // service worker only. The page must not go on saying that notifications are on.
       if (!notif.broken) {
         notif.broken = true;
+        writeStore(STORE.broken, '1'); // for the next visit: the button must not say "on" again
         safe(renderNotifyButton);
       }
       return false;
@@ -2683,32 +3200,97 @@
     }
   }
 
-  /* A word in front of the tab's title while nobody looks. `signalTime` ties it to one signal. */
-  function flagTitle(text, signalTime) {
-    if (document.visibilityState === 'visible' && document.hasFocus()) {
+  /*
+   * A word in front of the tab's title while nobody looks. Two kinds, each with an end:
+   * - a new signal ("BUY XAUUSD"): shown while the card is that signal, and dropped when the
+   *   signal has expired by the clock. The clock runs without ticks too, so a lost server
+   *   cannot leave the word there. Hidden, not dropped, while the card is something else for a
+   *   moment (the feed-down card): it is back when the same signal is on the card again.
+   * - a feed alert: "stopped" stays while the ticks say the feed is down; "back to normal"
+   *   goes after ALERT_FLAG_MS.
+   * The signal's word comes first: an alert never takes its place.
+   */
+  function looking() {
+    return document.visibilityState === 'visible' && document.hasFocus();
+  }
+
+  function flagSignal(text, row) {
+    if (looking() || !isNum(row.time) || !isNum(row.expires_at)) {
       return;
     }
-    notif.titleFlag = text;
-    notif.titleSignal = isNum(signalTime) ? signalTime : null;
-    document.title = text + ' · ' + notif.titleBase;
+    notif.signalFlag = { text: text, time: row.time, until: row.expires_at };
+    paintTitle();
+  }
+
+  function flagAlert(text, level) {
+    if (looking()) {
+      return;
+    }
+    notif.alertFlag = { text: text, down: level === 'down', wall: Date.now(), mono: performance.now() };
+    paintTitle();
   }
 
   function clearTitle() {
-    if (notif.titleFlag !== null) {
-      notif.titleFlag = null;
-      notif.titleSignal = null;
-      document.title = notif.titleBase;
+    notif.signalFlag = null;
+    notif.alertFlag = null;
+    paintTitle();
+  }
+
+  /* Drop the flags that have ended and write the title. Called on every tick and every second. */
+  function paintTitle() {
+    const tick = state.tick;
+    let text = null;
+    const signal = notif.signalFlag;
+    if (signal) {
+      // The server's clock carried on by whichever of this PC's two clocks moved further.
+      const now = tick && isNum(tick.now) ? tick.now + idleMs() / 1000 : null;
+      if (now === null || now >= signal.until) {
+        notif.signalFlag = null;
+      } else if (tick.card && tick.card.kind === 'signal' && tick.card.time === signal.time) {
+        text = signal.text;
+      }
+    }
+    const alert = notif.alertFlag;
+    if (alert) {
+      const ended = alert.down
+        ? Boolean(tick) && tick.feed !== 'down'
+        : Math.max(Date.now() - alert.wall, performance.now() - alert.mono) >= ALERT_FLAG_MS;
+      if (ended) {
+        notif.alertFlag = null;
+      } else if (text === null) {
+        text = alert.text;
+      }
+    }
+    const title = text === null ? notif.titleBase : text + ' · ' + notif.titleBase;
+    if (document.title !== title) {
+      document.title = title;
     }
   }
 
-  /* "BUY XAUUSD" in the tab strip must not outlive the signal: it goes when the card is no longer that signal. */
-  function expireTitleFlag() {
-    if (notif.titleFlag === null || notif.titleSignal === null) {
+  /* One signal, seen in the log of a snapshot or on the card of a tick: announced once, and only while it can be acted on. */
+  function noteSignal(row, now) {
+    const stored = Number(readStore(STORE.signal));
+    const shownElsewhere = Number.isFinite(stored) && stored >= row.time;
+    notif.lastSignal = row.time;
+    writeStore(STORE.signal, row.time);
+    if ((row.side === 'BUY' || row.side === 'SELL') && isNum(row.expires_at) && isNum(now) && row.expires_at > now) {
+      signalNotice(row, now, !shownElsewhere);
+    }
+  }
+
+  /*
+   * While /api/state fails, the ticks still carry the signal card. A signal newer than the
+   * last one seen is announced from that card, so a failing snapshot costs the log and the
+   * reasons but not the notification. The snapshot that comes later finds it already seen.
+   */
+  function checkTickSignal() {
+    const tick = state.tick;
+    const card = tick && tick.card;
+    if (!notif.baseline || snapshotJob.fails === 0 || state.lost || !card || card.kind !== 'signal') {
       return;
     }
-    const card = state.tick && state.tick.card;
-    if (!card || card.kind !== 'signal' || card.time !== notif.titleSignal) {
-      clearTitle();
+    if (isNum(card.time) && card.time > notif.lastSignal) {
+      noteSignal(card, tick.now);
     }
   }
 
@@ -2738,15 +3320,7 @@
     }
 
     if (newest && newest.time > notif.lastSignal) {
-      const stored = Number(readStore(STORE.signal));
-      const shownElsewhere = Number.isFinite(stored) && stored >= newest.time;
-      notif.lastSignal = newest.time;
-      writeStore(STORE.signal, newest.time);
-      const now = isNum(snap.now) ? snap.now : estimatedNow();
-      // Only a signal that can still be acted on is announced.
-      if ((newest.side === 'BUY' || newest.side === 'SELL') && isNum(newest.expires_at) && isNum(now) && newest.expires_at > now) {
-        signalNotice(newest, now, !shownElsewhere);
-      }
+      noteSignal(newest, isNum(snap.now) ? snap.now : estimatedNow());
     }
 
     if (newestAlert > notif.lastAlert) {
@@ -2762,7 +3336,7 @@
       for (const alert of fresh) {
         const words = pick(LEVEL_WORDS, String(alert.level)) || String(alert.level);
         pushNotice('TradePilot · ' + words, String(alert.text || ''), 'tradepilot-alert-' + alert.time);
-        flagTitle(words);
+        flagAlert(words, alert.level);
       }
       if (fresh.length) {
         beep('alert');
@@ -2782,7 +3356,7 @@
       pushNotice(title, body, 'tradepilot-signal-' + row.time, (row.expires_at - now) * 1000);
     }
     beep('signal');
-    flagTitle(row.side + ' ' + state.symbol, row.time);
+    flagSignal(row.side + ' ' + state.symbol, row);
   }
 
   // ---------------------------------------------------------------- UI wiring
@@ -2833,6 +3407,11 @@
     }
     state.leaving = true;
     closeStream();
+    if (state.leaveTimer !== null) {
+      // The session had ended and the page was about to leave by itself: one navigation, this one.
+      window.clearTimeout(state.leaveTimer);
+      state.leaveTimer = null;
+    }
     window.location.assign('/login');
   }
 

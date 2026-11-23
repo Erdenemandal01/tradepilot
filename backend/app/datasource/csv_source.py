@@ -65,6 +65,17 @@ class CsvSource(DataSource):
             frame = cd.aggregate(frame, self.timeframe, timeframe)
         return frame.tail(limit).reset_index(drop=True)
 
+    def fetch_history(self, timeframe: str, start: int | None = None, end: int | None = None) -> pd.DataFrame:
+        """The file's candles from ``start`` to ``end`` (open times), all of them by default."""
+        frame = self._load()
+        if timeframe != self.timeframe:
+            frame = cd.aggregate(frame, self.timeframe, timeframe)
+        if start is not None:
+            frame = frame[frame["time"] >= start]
+        if end is not None:
+            frame = frame[frame["time"] <= end]
+        return frame.reset_index(drop=True)
+
     def fetch_quote(self) -> Quote:
         closed = self._load()
         closed = closed[closed["closed"]]
