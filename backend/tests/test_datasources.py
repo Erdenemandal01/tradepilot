@@ -99,6 +99,11 @@ def test_binance_quote_uses_bid_ask_and_exchange_time():
         [["not", "a", "kline"]],
         [["soon", "1", "2", "0.5", "1.5", "1", 0]],  # open time is not a number
         [kline(T0, 4000, 3990, 3999, 4001)],  # high below open: fails validation
+        # Volume: never negative, never infinite (it would leave in an event as bare Infinity).
+        [kline(T0, 4000, 4002, 3999, 4001)[:5] + ["-5", 0, "0", 1]],
+        [kline(T0, 4000, 4002, 3999, 4001)[:5] + ["Infinity", 0, "0", 1]],
+        [[float("inf"), "4000", "4002", "3999", "4001", "1", 0]],  # 1e400 or Infinity as the open time
+        [kline(T0, 4000, 4002, 3999, 4001)[:2] + ["inf"] + kline(T0, 4000, 4002, 3999, 4001)[3:]],
     ],
 )
 def test_binance_bad_kline_responses_raise(payload):
@@ -109,12 +114,27 @@ def test_binance_bad_kline_responses_raise(payload):
 
 @pytest.mark.parametrize(
     "payload",
-    [{"code": -1121, "msg": "Invalid symbol."}, {"bidPrice": "4067", "askPrice": "4066"}, {"bidPrice": "x", "askPrice": "1"}],
+    [
+        {"code": -1121, "msg": "Invalid symbol."},
+        {"bidPrice": "4067", "askPrice": "4066"},
+        {"bidPrice": "x", "askPrice": "1"},
+        {"bidPrice": "4066", "askPrice": "Infinity"},  # 0 < bid <= ask would let infinity through
+        {"bidPrice": "4066", "askPrice": "4067", "time": float("inf")},  # OverflowError, not DataSourceError, before
+    ],
 )
 def test_binance_bad_quote_responses_raise(payload):
     source = BinanceSource(get_json=FakeHttp({"/fapi/v1/ticker/bookTicker": payload}))
     with pytest.raises(DataSourceError):
         source.fetch_quote()
+
+
+@pytest.mark.parametrize("limit", [1, 3, 1500])
+def test_binance_an_empty_klines_answer_is_an_error_not_an_empty_frame(limit):
+    # The exchange can answer [] (a symbol in maintenance, a copy that has nothing yet). No candle is not data.
+    fake = FakeHttp({"/fapi/v1/klines": []})
+    source = BinanceSource(get_json=fake, clock=lambda: T0 + 10 * M15)
+    with pytest.raises(DataSourceError, match="no candles"):
+        source.fetch_candles("M15", limit=limit)
 
 
 def test_binance_network_errors_propagate_as_datasource_errors():

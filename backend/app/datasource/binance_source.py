@@ -2,7 +2,8 @@
 
 Only two public read-only endpoints are used: ``/fapi/v1/klines`` (candles,
 also for older history in pages) and ``/fapi/v1/ticker/bookTicker`` (best bid
-and ask). No account endpoints,
+and ask), plus the public kline market stream for the chart
+(``open_candle_stream``; never used for signals). No account endpoints,
 no keys, no signed requests.
 
 The contract is quoted in USDT and trades 24/7, so its price differs from a
@@ -19,25 +20,30 @@ delay: a candle is picked up on the first poll after the next one appears.
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any, Callable
 
 import pandas as pd
 
 from backend.app.core import candles as cd
-from backend.app.datasource import http
+from backend.app.datasource import http, ws
 from backend.app.datasource.base import (
     Clock,
     DataSource,
     DataSourceError,
     JsonGetter,
     Quote,
+    StreamCandle,
     check_limit,
     to_float,
     to_int,
 )
 
 BASE_URL = "https://fapi.binance.com"
+# Market streams live under the routed path; the legacy wss://fstream.binance.com/ws/<stream> accepts a
+# connection but pushes nothing (tried on 2026-11-23).
+STREAM_URL = "wss://fstream.binance.com/market/ws"
 INTERVALS = {
     "M1": "1m",
     "M3": "3m",
@@ -59,9 +65,76 @@ HISTORY_PAUSE = 0.5
 HISTORY_MAX_PAGES = 400  # 600,000 candles: a wall against a loop that never ends
 
 
+class BinanceCandleStream:
+    """The exchange's live kline stream of one interval: public market data, no key, nothing sent but pongs.
+
+    The exchange pushes the forming candle about every 250 ms while trades
+    happen, and once more with ``x: true`` when it has closed.
+    """
+
+    def __init__(self, socket: ws.WebSocket, symbol: str, timeframe: str) -> None:
+        self._socket = socket
+        self._symbol = symbol
+        self._timeframe = timeframe
+        self._interval = INTERVALS[timeframe]
+
+    def read(self, timeout: float) -> StreamCandle | None:
+        deadline = time.monotonic() + max(float(timeout), 0.0)
+        while True:
+            text = self._socket.recv(max(deadline - time.monotonic(), 0.0))
+            if text is None:
+                return None
+            candle = self._parse(text)
+            if candle is not None:
+                return candle
+            if time.monotonic() >= deadline:
+                return None
+
+    def _parse(self, text: str) -> StreamCandle | None:
+        try:
+            message = json.loads(text)
+        except ValueError:
+            self.close()
+            raise DataSourceError("Binance stream: a message that is not JSON") from None
+        if not isinstance(message, dict) or message.get("e") != "kline":
+            return None  # not a candle (an answer to a request, for instance): nothing to read in it
+        k = message.get("k")
+        if not isinstance(k, dict) or message.get("s") != self._symbol or k.get("i") != self._interval:
+            self.close()
+            raise DataSourceError(f"Binance stream: a kline of another instrument or interval {str(message)[:200]}")
+        try:
+            opened = to_int(k.get("t"), "open time")
+            closed = k.get("x")
+            if opened % 1000 or not isinstance(closed, bool):
+                raise DataSourceError(f"Binance stream: bad kline {str(k)[:200]}")
+            candle = StreamCandle(
+                time=opened // 1000,
+                open=to_float(k.get("o"), "open"),
+                high=to_float(k.get("h"), "high"),
+                low=to_float(k.get("l"), "low"),
+                close=to_float(k.get("c"), "close"),
+                volume=to_float(k.get("v"), "volume"),
+                closed=closed,
+                event_time=to_int(message.get("E"), "event time") / 1000,
+            )
+            # The candle must be one the REST answer could hold: aligned, positive, high and low around it.
+            cd.validate(pd.DataFrame([candle.bar()]), self._timeframe)
+        except DataSourceError:
+            self.close()
+            raise
+        except ValueError as error:
+            self.close()
+            raise DataSourceError(f"Binance stream: kline failed validation: {error}") from None
+        return candle
+
+    def close(self) -> None:
+        self._socket.close()
+
+
 class BinanceSource(DataSource):
     name = "binance"
     chart_timeframes = tuple(INTERVALS)
+    stream_timeframes = tuple(INTERVALS)
 
     def __init__(
         self,
@@ -71,6 +144,8 @@ class BinanceSource(DataSource):
         base_url: str = BASE_URL,
         sleep: Callable[[float], None] = time.sleep,
         history_pause: float = HISTORY_PAUSE,
+        connect_stream: Callable[[str], ws.WebSocket] | None = None,
+        stream_url: str = STREAM_URL,
     ) -> None:
         self.symbol = symbol
         self._get_json = get_json
@@ -78,12 +153,24 @@ class BinanceSource(DataSource):
         self._base_url = base_url
         self._sleep = sleep
         self._history_pause = history_pause
+        self._connect_stream = connect_stream or (lambda url: ws.connect(url, timeout=10.0))
+        self._stream_url = stream_url
+
+    def open_candle_stream(self, timeframe: str) -> BinanceCandleStream:
+        """The routed market stream ``<symbol>@kline_<interval>`` (the legacy /ws path pushes nothing)."""
+        if timeframe not in INTERVALS:
+            raise ValueError(f"Binance source has no stream for timeframe {timeframe!r}")
+        url = f"{self._stream_url}/{self.symbol.lower()}@kline_{INTERVALS[timeframe]}"
+        return BinanceCandleStream(self._connect_stream(url), self.symbol, timeframe)
 
     def fetch_candles(self, timeframe: str, limit: int = 500) -> pd.DataFrame:
         check_limit(limit, MAX_LIMIT)
         if timeframe not in INTERVALS:
             raise ValueError(f"Binance source does not support timeframe {timeframe!r}")
         records = self._klines({"symbol": self.symbol, "interval": INTERVALS[timeframe], "limit": str(limit)})
+        if not records:
+            # The newest candles always exist on a listed contract: an empty list is a failed answer.
+            raise DataSourceError(f"Binance klines: no candles in the answer to a request for {limit}")
         return self._frame(records, timeframe, newest_closed=False)
 
     def _klines(self, params: dict[str, str]) -> list[dict[str, Any]]:

@@ -15,6 +15,11 @@ price source --every 2 s--> LiveFeed (backend/app/live.py, one thread)
    -> every cycle: one `tick` pushed to every open page (server-sent events)
 ```
 
+The chart has its own live path beside this one (see "The chart's live
+stream" below): a WebSocket kline stream from the source. Signals never
+depend on it: the feed above polls closed M15 candles over REST, and nothing
+the chart stream does can create, change, delay or block a decision.
+
 A cycle costs two small public requests. Indicators are recomputed only when
 a candle closes; a tick only moves the price, the forming candle and the
 state of the current signal. A signal reaches the page about 2 to 4 seconds
@@ -78,8 +83,27 @@ tick still goes out every poll interval. It carries no new data, only the
 feed's age judged at that moment, so a page can tell a silent source from a
 lost server.
 
-The clock (`now`) is the newest time the source has reported plus the time
-passed since. It keeps running when the source repeats an old answer.
+The clock (`now`) runs on from a time the source reported plus the time
+passed since. A quote dated ahead of it moves it forward. An older quote
+does not set it back: when the source repeats an old answer, or the first
+quote after an outage is minutes old (a copy that lags), the clock keeps
+running and that quote shows its age, so the feed reads late or down and an
+expired signal never reads valid again. The clock goes back only to the
+freshest quote of a whole hour in which no quote was ahead of it (a quote
+once dated ahead, or a PC stopwatch that runs a little fast). That hour
+starts with the first quote behind the clock since it was last set (a
+quote repeated unchanged does not count twice). So one quote dated ahead,
+by 90 seconds or by two hours, takes the feed down for about an hour, not
+for the jump and an hour.
+
+An answer without a single candle, and one whose candles end before the
+stored ones (a copy of the source that is a candle behind), bring nothing
+new: the cycle counts as failed, the stored candles and the last quote stay,
+and the feed's age runs on from the last answer that was right. Answers that
+alternate between a right copy and one that is behind therefore load
+nothing again and raise no `reloaded`. Only after a whole minute of nothing
+but answers that end before the stored candles is the source believed: the
+history is loaded once as it is then, with `reloaded`.
 
 Filters applied now: stale feed, market hours (a rule of thumb, see
 `core/pricecheck.probably_closed`, until the broker's hours are known), H1
@@ -115,14 +139,20 @@ How the login behaves:
 - Static paths are checked as text first: a backslash, a colon, a NUL or a
   `..` part is a 404 before any file call.
 - On Ctrl-C the open streams are ended first, so the server stops although a
-  dashboard is open.
+  dashboard is open. A chart stream thread that is still opening its
+  connection (a connect or handshake that hangs) is waited for at most half a
+  second; it is a daemon thread and ends by itself.
+- Logging out removes the cookie from that browser and ends that session on
+  the server as well: a copy of the token gets 401, and streams opened with
+  it end (a chart stream within a second, the tick stream at its next tick).
 
 Known limits, accepted for a one-owner site:
 
 - The pause after wrong passwords is one counter for everybody, not one per
   address: someone guessing can also keep the owner waiting.
-- Logging out removes the cookie from that browser; the token itself stays
-  valid until its 12 hours are over. Setting a new password (a new session
+- The sessions ended by logging out are kept in the server's memory only. A
+  restart of the server forgets them: a copy of a logged-out token works
+  again until its 12 hours are over. Setting a new password (a new session
   secret) ends every session at once.
 - `set_password` writes `.env` with mode 0600 on Linux and macOS. On Windows
   the folder's access list decides who can read it; other accounts on the
@@ -135,7 +165,8 @@ Known limits, accepted for a one-owner site:
 | `GET /` | the dashboard page |
 | `GET /api/state` | the snapshot below |
 | `GET /api/stream` | server-sent events, event name `tick`, data = the tick below |
-| `GET /api/candles?timeframe=<chart timeframe>&limit=1..1500` | the candles answer below; 422 for a timeframe the source cannot show, 503 with `Retry-After` when the source gives nothing |
+| `GET /api/candles?timeframe=<chart timeframe>&limit=1..1500` | the candles answer below; 422 for a timeframe the source cannot show, 503 with `Retry-After` when the source gives nothing right now (an empty answer included, and the signal timeframe before the feed's first answer) |
+| `GET /api/candles/stream?timeframe=<chart timeframe>` | server-sent events, event name `candles`, see "The chart's live stream"; 422 as above, 503 with `Retry-After: 10` beyond 8 open chart streams |
 | `GET /api/quote`, `/api/signal/latest`, `/api/signals?limit=` | parts of the snapshot |
 | `GET /api/news`, `/api/stats` | `{"available": false, ...}` until Phases 4, 5 and 8 |
 | `POST /api/notify/test` | sends a test email; 409 when SMTP is not configured |
@@ -153,7 +184,12 @@ price, bid, ask       float or null (the last real values while the feed is down
 market_closed  bool   rule of thumb for the broker's hours
 bars           {"M15": [bar, bar], "H1": [bar, bar]}  the two newest candles of the signal
                timeframe and of H1; {} while the feed is down
-               bar: {time, open, high, low, close, closed}; closed false = still forming
+               bar: {time, open, high, low, close, volume, closed}; closed false = still forming;
+               volume null: the source gave none (H1: summed over its quarters)
+               The H1 entry is the rule's filter view: built by the feed from its own M15
+               candles. The chart's H1 comes from the source's 1h candles (its own origin),
+               so the page does not draw this entry. The page may draw the M15 entry on
+               the M15 chart: those are the feed's own candles, as is M15's history.
 poll_seconds   2.0   how often ticks come; the page calls the server lost after
                max(10 s, 3 x this) without one. It is in every tick, so a page whose
                /api/state fails still has it.
@@ -189,8 +225,18 @@ email     bool   whether SMTP is configured
 utc_offset_hours  8
 alert_after_seconds  300   how long the feed is down before the email alert
 rules     {status: "experimental", filters_off: ["NEWS_WINDOW"], market_hours: "approximate"}
-chart     {timeframes: [...], signal_timeframe: "M15", filter_timeframe: "H1"}
+chart     {timeframes: [...], signal_timeframe: "M15", filter_timeframe: "H1",
+           missing: {...}, shortest: "M1", stream: {available, timeframes}}
           timeframes: the chart timeframes this source can show, shortest first
+          missing: each of the 18 menu timeframes this source cannot show, with a reason code:
+            "no_shorter_candles"  the source's shortest candle (`shortest`) is longer than this one
+                                  (CSV and other M15-only sources: M1, M2, M3, M5, M10)
+            "cannot_build"        no candle of the source fills this one exactly
+          shortest: the source's shortest candle, its own or the signal timeframe
+          stream.available: whether the chart has a live candle stream with this source and
+            setting (Binance with TRADEPILOT_CHART_STREAM=true); false: the chart stream route
+            still works, from polling ("mode": "poll")
+          stream.timeframes: the chart timeframes the live stream moves (their origin streams)
 prediction  the forecast of the next 4 M15 closes (60 minutes); see "The forecast" below
 ```
 
@@ -203,9 +249,21 @@ built_from     null, or the shorter candles the server combined (M45 from "M15")
 history        "full" | "short"; short: the first bar is the oldest candle the source has
 partial_first  true when the first bar was built from a bucket whose beginning does not exist
 gaps           places where a candle is missing between two bars (nothing is drawn there)
+rev            the history counter of this timeframe's origin (see "The chart's live stream")
 bars           oldest first: {time, open, high, low, close, volume, closed}
-               closed false marks the forming candle (only the last one can be)
+               closed false marks the forming candle (the last one), and for a few
+               seconds the one before it when the live stream closed it without the
+               exchange's own flag (by starting the next one): its final values are not
+               confirmed yet (see "The chart's live stream"). Every other bar is final.
+               volume null: the source gave none (draw no volume bar); never negative
+               or infinite (a source answer with such a volume is refused)
 ```
+
+Three answers the page words differently: 422 (this source cannot show the
+timeframe at all: see `chart.missing` for why), 503 with `Retry-After`
+(nothing right now: try again after that many seconds), and `history:
+"short"` (the candles are real but the source's history begins at the first
+one).
 
 ## Chart timeframes
 
@@ -221,10 +279,23 @@ Monday, MN3 / MN6 / MN12 are calendar quarters, half-years and years
 Where a timeframe's candles come from (`backend/app/chart.py`):
 
 - M15 (the signal timeframe): the live feed's memory, the very candles the
-  rule ran on.
+  rule ran on. The M15 stream may add three things to them: its newer state
+  of the feed's newest candle while that one forms (not when the feed's own
+  state has more volume traded: then the feed's is the newer one), that
+  candle's final values once the exchange closed it with its own flag, and
+  the candle after it, but only once the one before is closed, in the feed
+  or by that flag. The next candle never closes a candle the feed still has
+  as forming, and nothing further than one candle past the feed's own is
+  laid. A candle the feed has closed is never changed, and the feed's memory
+  itself is never touched. The event's freshness (`mode` "stream", `at`,
+  `age`) comes from the stream only while the stream's newest candle is the
+  newest one shown; otherwise it is the feed's own, so a feed that is stuck
+  reads late and then down on the chart too, however long the stream runs.
 - A length the source has itself (Binance: M1, M3, M5, M30, H1, H2, H4, D1,
   W1, MN1): asked from the source, kept in memory, and refreshed with a
-  3-candle request at most once per poll interval however many pages ask.
+  3-candle request at most once per poll interval however many pages ask
+  (months too, by calendar steps: one load of 240 months, then 3-month
+  tails), unless the live stream keeps it current.
 - Anything else is built from the longest shorter candles that fill it
   exactly: M2 from M1, M10 from M5, M45 from M15, H3 from H1, MN3 / MN6 /
   MN12 from MN1. A source without intervals of its own (Twelve Data, CSV)
@@ -234,18 +305,133 @@ Building (`core/candles.resample`): first open, highest high, lowest low,
 last close, summed volume. A candle is never built over a hole: that bucket
 is left out and counted in `gaps`. The newest bucket is kept as forming; the
 oldest one is kept, and flagged `partial_first`, only when the source has
-nothing older.
+nothing older. A built candle is closed only when its bucket is complete and
+its last part is closed; a newest bucket that lacks a part is never shown,
+let alone as closed.
 
-Live updates: M15 and H1 ride on the tick. For any other timeframe on screen
-the page asks for the 3 newest candles about every 2 seconds and moves the
-chart with them. When the source fails, the chart request answers 503, the
-source is left alone for 5 seconds (or as long as it asked after a refusal),
-and no kept candle is passed off as current. None of this touches the signal
-path.
+An empty answer from the source is never data: it is not kept in place of
+the candles, and the route answers 503.
+
+When the source fails, the chart request answers 503, the source is left
+alone for 5 seconds (or as long as it asked after a refusal), and no kept
+candle is passed off as current. None of this touches the signal path.
+
+## The chart's live stream (`GET /api/candles/stream?timeframe=TF`)
+
+Signals never depend on the chart stream: the feed polls closed M15 candles
+over REST, does not read any stream, and decides the same with or without one.
+
+One timeframe, one origin, history and live alike: the live bars of a
+timeframe come from the same candles as its `/api/candles` history (M2 from
+M1, H1 from the source's 1h candles, M15 from the feed). The page draws
+nothing from the tick for any timeframe but M15.
+
+How it works (`backend/app/chart.py`, `backend/app/candlestream.py`,
+`backend/app/datasource/ws.py`):
+
+- One thread per origin timeframe somebody is watching, started by the first
+  open chart stream that needs it and stopped when nobody has watched it for
+  30 s. Binance: `wss://fstream.binance.com/market/ws/xauusdt@kline_<interval>`
+  (public market data, no key; the client sends nothing but pongs). The
+  exchange pushes the forming candle about every 250 ms while trades happen,
+  and once more with its own `closed` flag at the end.
+- Each update is laid over the kept candles (`core/candles.lay_stream`): the
+  same open time replaces the newest candle, the next one is appended, an
+  older one is ignored, and a jump over a missing candle is never built
+  over: the candles are refilled over REST instead.
+- After every (re)connect the origin is refilled over REST (tail, or the whole
+  history when the tail does not reach), so candles missed while
+  disconnected are there, once and in order. A dropped stream is opened again
+  after 1, 2, 5, 10, then 30 s; a refusal (418, 429) is waited out. The
+  pauses start again at 1 s only after a connection that delivered and stayed
+  up for a minute: a stream that is cut right after its first update, again
+  and again, waits longer each time (and its refills with it), like one that
+  never opens. A message that cannot be read (not JSON, a number that is not
+  finite such as `Infinity` or `1e400`, a negative volume) breaks the
+  connection like any other failure and counts for the pauses.
+- While the stream delivered within the poll interval (2 s), the origin's REST
+  tail refresh is skipped. When it has been silent longer, or is down, REST
+  refreshes as it did before. So the stream only makes things faster.
+- A candle the exchange closed with its own flag keeps those values: a REST
+  answer from a copy that lags and still lists it as the forming newest one,
+  with its values from before the close, does not reopen it.
+- A candle the stream closed only by starting the next one (no closed flag
+  seen, for instance after a reconnect) may lack its last trades. It is sent
+  with `closed: false` until a REST answer lists a newer candle (asked about
+  2 s later, again while a lagging copy still lists it as the newest, at most
+  5 times); then it is sent closed with REST's final values. A built candle
+  that holds it is not closed before that either.
+- `TRADEPILOT_CHART_STREAM=false` switches the stream off: everything works
+  from polling, `mode` is always "poll".
+
+Events: name `candles`, data:
+
+```
+timeframe    the chart timeframe asked for
+bars         the newest 3 bars, oldest first, in the shape of /api/candles bars
+             ([] when error is set: nothing is passed off as current)
+mode         "stream": the origin's live stream is connected and delivered within 10 s
+             "poll":   the bars come from the REST-refreshed candles (no stream for this
+                       source or timeframe, the setting is off, or the stream is down or quiet)
+at           the source's time of the newest confirmation of these candles, UTC seconds:
+             the exchange's event time of the last stream update, or, from polling, the
+             server's clock when the last REST answer (or the feed's last good cycle, for
+             M15 and what is built from it) arrived; null before any
+age          seconds since the server received that confirmation (its own stopwatch;
+             no clock difference in it). Rises while nothing new arrives.
+rev          history counter of the origin: moves whenever candles older than the newest
+             three changed (a refill after a reconnect, a reload, a hole that healed).
+             /api/candles carries the same number.
+gaps         breaks in the whole kept history of this timeframe (count_breaks over up to
+             1500 candles; /api/candles counts only within its limit)
+error        null, or "unavailable": the source gives nothing right now
+retry_after  with error: seconds before the source is asked again; else null
+```
+
+Example (real, Binance XAUUSDT, M1, 2026-11-23):
+
+```
+event: candles
+data: {"timeframe": "M1", "bars": [{"time": 1795439220, "open": 3624.38, "high": 3625.64,
+"low": 3623.02, "close": 3625.4, "volume": 445.315, "closed": true}, {"time": 1795439280,
+"open": 3625.46, "high": 3627.88, "low": 3625.46, "close": 3626.85, "volume": 460.308,
+"closed": true}, {"time": 1795439340, "open": 3626.77, "high": 3626.77, "low": 3626.48,
+"close": 3626.48, "volume": 10.699, "closed": false}], "mode": "stream", "at": 1795439341.101,
+"age": 0.0, "rev": 1, "gaps": 0, "error": null, "retry_after": null}
+```
+
+Timing: the first event is sent at once. Then an event whenever the bars,
+`mode`, `rev`, `gaps` or `error` changed, at most one every 0.2 s per page
+(what changed meanwhile is coalesced: the newest state wins, there is never
+a backlog), and at least one every 5 s as a heartbeat (same bars, newer
+`age`). A page can call the chart late when `age` grows past a few seconds
+and the stream silent when no event came for well over 5 s. An update of
+one origin wakes only the chart streams whose timeframe comes from it (each
+stream also looks at its candles every 0.5 s, which is how M15 and M45 see a
+new feed cycle). The events are strict JSON: a number that is not finite is
+never sent (such an event is left out and logged).
+
+What the page does with it: see "The page and the chart" below. At most 8
+chart streams are open at once; the slot is taken when the request is
+accepted, so streams asked for at the same moment cannot pass the limit
+together, and it is given back however the response ends, also when it never
+starts. The stream ends when the session ends (logging out included) and
+when the server stops (Ctrl-C with a page open still stops the server at
+once).
+
+Browsers allow about six connections to one server over HTTP/1.1, which
+uvicorn serves. Every open dashboard keeps its tick stream (signals are
+announced from hidden tabs too), and the tab on screen also its chart
+stream; a tab hidden for more than 10 s gives its chart stream back and
+asks for no tail requests. So up to four dashboard tabs leave a connection free for the
+other requests (before the chart stream: five); with more, requests wait in
+the browser's queue until a tab is closed. HTTP/2 behind the proxy of the
+deployment (Phase 9) removes this limit.
 
 In the page the chosen timeframe and the starred ones (quick buttons, M15 and
 H1 by default) are kept in the browser's local storage. Choosing quickly is
-safe: every load carries a number and only the newest one may fill the chart.
+safe: every load carries a number and only the newest one may fill the chart,
+and only the newest choice's chart stream is drawn.
 
 ## The forecast (`prediction` in `GET /api/state`)
 
@@ -385,8 +571,9 @@ app starts all the same) when:
   or not the sum of the two sides, no samples, a negative error, `from`
   after `to` or outside real time, another `scope`; or it contradicts
   itself: `better_than_baseline` true with an error not below the
-  baseline's, fewer than 300 calls or a hit rate not above 0.5, or a hit
-  rate given although `calls` is 0;
+  baseline's, fewer than 300 calls, a hit rate not above 0.5 or one whose
+  lower 95% bound (`core/forecast.hit_rate_floor` of the calls and the hits
+  they imply) is not above 0.5, or a hit rate given although `calls` is 0;
 - its record cannot be this model's: the model does not say how many rows
   it was fitted on (`model.rows`), more forecasts were scored than that, or
   `train_rows` is under half of it or above it;
@@ -450,7 +637,13 @@ On the page (`frontend/static/app.js`, `syncForecast`):
   last closed candle's close through the four expected closes, each marked
   with a dot, and two thin faint lines through `low` and `high`. At the end
   of the line the word "Таамаг" is written on the chart (a dot and a word,
-  not an arrow: it is not a signal). At the default zoom the line is only
+  not an arrow: it is not a signal). While a signal's TP and SL labels are
+  at the chart's right edge, the word goes to the first place they cannot
+  cover (`forecastWordPlace`, judged in pixels after every tick, zoom and
+  scroll): the end of the line, then the points before it, then the line's
+  start, on either side; when no place is clear (a chart zoomed far out with
+  both levels near the line) it stays at the end, on the side with more
+  room. At the default zoom the line is only
   four candles long; the dots and the word are what make it findable. The
   series carry no price label, no price line and no crosshair dot, and they
   are not part of the O/H/L/C legend.
@@ -483,7 +676,9 @@ On the page (`frontend/static/app.js`, `syncForecast`):
   record: counts that are whole and not negative, `calls` not above
   `samples` and the sum of its two sides, shares between 0 and 1, errors not
   negative, `from` <= `to` in real time, `scope` "open_market", and no
-  `better_than_baseline` that its own numbers do not carry. Anything else is
+  `better_than_baseline` that its own numbers do not carry (the page asks
+  for the same as the server: at least 300 calls, an error below the
+  baseline's, and a hit rate whose lower 95% bound is above 0.5). Anything else is
   "could not be computed": no line, and nothing of that record is printed.
 - The words are under the chart and in the chart's legend entry: direction
   (өсөх / буурах / тодорхойгүй), the probability, the expected close in 60
@@ -545,10 +740,103 @@ On the page (`frontend/static/app.js`, `syncForecast`):
 
 ## The page and the chart
 
-The chart holds the candles of `/api/candles` and moves its two newest bars
-with every tick. When a tick shows that a candle on screen missed its close
-(the page slept, the stream was down), the page loads the candles again and
-keeps asking on every tick until one load succeeds.
+(`frontend/static/app.js`, "the chart's own candle stream".) Signals never
+depend on any of this: the chart is a view.
+
+Where the candles come from. The history is `/api/candles` (1500 candles).
+The newest candles come from one writer at a time:
+
+- the chart stream (`/api/candles/stream`), one EventSource for the timeframe
+  on screen, opened after the tick stream and replaced when the timeframe
+  changes. While it delivers (an event without `error` in the last 8 s) it
+  alone moves the chart: the tick's bars and the tail requests are not used
+  for drawing then. A tab hidden for more than 10 s closes it (and makes no
+  tail requests); when the tab shows again, the history is loaded again and
+  the stream reopened. A shorter hide changes nothing.
+- while it is silent for longer than that, or broken: on M15 the tick's M15
+  bars (the feed's own candles, as is the M15 history), on any other
+  timeframe a request for its newest 3 candles about every 1.5 s, as before
+  the chart stream existed. The tick's H1 bars are never drawn: they are the
+  filter's view, built from the feed's M15 candles, while the H1 history comes
+  from the source's 1h candles. One timeframe, one origin.
+
+A chart stream that the browser gave up (an error answer: 401, 422, 503) is
+opened again after 2, 5, 10, then 30 s, each time after asking `/api/state`
+(which leads to the login page when the session has ended). One that stays
+open but silent for 20 s is opened again. An event of a timeframe that is not
+on screen any more, or bars that are not candles of the named timeframe, are
+not drawn.
+
+Drawing. The candle on screen and the next one go through the library's
+`update()`: the forming candle moves in place, a candle that closes keeps
+its final values and the next one is added once. An older candle of an event
+may only get final values (a closed candle confirmed after its close, drawn
+with the library's historical update); it never becomes a forming one again.
+An event or a tick whose candles start after the candle on screen, or jump
+over a candle, means a missed close: the history is loaded again, and asked
+for on every update until a load succeeds. When an event's `rev` differs from
+the `rev` of the history on screen, or its `gaps` from the previous event's,
+the history is loaded again too. A reload keeps the view: following the
+newest candle it keeps following it, scrolled into the history it keeps the
+same candles in view at the same zoom. A 503 is waited out for its
+`Retry-After`.
+
+Measured on 2026-11-23 with the real source on M1 (the newest candle's
+O/H/L/C in the page's legend, 80 s): 215 changes, a median 0.31 s apart, 90%
+within 0.57 s, the longest gap 1.34 s. Before the chart stream: 14 changes,
+4.0 s, 8.1 s and 12.1 s.
+
+On the chart:
+
+- Volume bars under the candles, on a scale of their own in the lowest fifth,
+  in the candle's colour and dimmer than the candles (dimmer still while the
+  candle forms). A candle without volume data (`volume` null) gets no bar,
+  and the legend shows a dash. A row without a `volume` field at all (a tick
+  of an older server) keeps the volume the page already has for that candle.
+- The legend above the chart shows O, H, L, C and V of the candle under the
+  crosshair, and of the newest candle when the pointer leaves the chart.
+- On the right price axis the newest candle's label shows its close and the
+  time left until it closes, for example `3626.03 · 00:22`: mm:ss up to H1,
+  h:mm:ss up to D1, days for W1 and the month timeframes (h:mm:ss in their
+  last day), zeros once the time is up. The close time is the open time plus
+  the candle's length, calendar months included; the clock is the server's,
+  as the page estimates it from the ticks. One width per timeframe, so the
+  axis does not change width while it counts. The label is coloured like the
+  candle while the chart's candles are current and grey while they are late
+  or down. It is the candle's close (the source's last trade), not Bid or Ask;
+  the legend under the chart says so. On a chart narrower than 480 px (a
+  phone) the label shows the close only, so the axis stays narrow, and the
+  time left is written in the O H L C row ("хаагдах хүртэл 00:22").
+- The chip beside the title names the real source and symbol ("Binance
+  XAUUSDT") and the state of the chart's own candles, apart from the feed's
+  status in the header: "шууд урсгал" (the stream delivers), "асуулгаар
+  шинэчилж байна" (the server or the page polls), "хоцорч байна" (the newest
+  confirmation is over 10 s old) and "тасарсан" (an error, over 60 s, or the
+  server lost), with the time of the last update when it is not live.
+- Dragging moves the chart, the plain mouse wheel zooms it (as on
+  TradingView; the owner asked for it), a sideways wheel moves it, a pinch
+  zooms it on a phone, and a vertical swipe on a phone scrolls the page.
+  While the newest candle is in view a zoom keeps the right edge where it is
+  (the library's `rightBarStaysOnScroll`), so zooming in never pushes the
+  newest candle out of view; scrolled into the history, a zoom centres on
+  the pointer.
+  Live updates never change the visible range or the zoom; a user who
+  scrolled into the history stays there while candles arrive. The button
+  «Шууд ханш руу» shows while the newest candle is out of view; it goes back
+  to the newest candle at the same zoom, and from there the chart follows new
+  candles again.
+- Signal markers sit on the candle that holds the signal's time, on every
+  timeframe. The forecast exists on M15 only; another timeframe clears it.
+
+The timeframe menu keeps its 18 timeframes, groups, stars and quick buttons.
+A timeframe this source cannot show stays in the menu, disabled, and says why
+in its row (from `chart.missing`): for an M15-only source (CSV, a test
+source) "Энэ эх үүсвэрт M15-аас богино лаа байхгүй". On the chart a 503 is
+worded as a temporary failure of the source, and `history: "short"` as a
+short history; they are not the same message.
+
+The signal log's footnote says that "TP-д хүрсэн" / "SL-д хүрсэн" means the
+source's price touched that reference level, not the owner's trade.
 
 The source's instrument can trade while the broker is closed (Binance
 XAUUSDT trades through the weekend). Those candles are real trades of the

@@ -129,7 +129,14 @@ def _check_ranges(skill: dict[str, Any]) -> None:
         refuse("a hit rate is given although no call was made")
     if skill["better_than_baseline"]:
         # What core/forecast.judge needs at the least; a record that claims more than it shows is refused.
-        if skill["calls"] < fc.MIN_CALLS or not skill["mae"] < skill["baseline_mae"] or not skill["hit_rate"] > 0.5:
+        # The third condition can be worked out from the record: the lower 95% bound of its hit rate.
+        hits = round(skill["hit_rate"] * skill["calls"])
+        if (
+            skill["calls"] < fc.MIN_CALLS
+            or not skill["mae"] < skill["baseline_mae"]
+            or not skill["hit_rate"] > 0.5
+            or not fc.hit_rate_floor(hits, skill["calls"]) > 0.5
+        ):
             refuse("better_than_baseline is true but its own numbers say otherwise")
 
 

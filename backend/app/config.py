@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     poll_seconds: float = 2.0
     history_candles: int = 1500
     alert_after_seconds: int = 300
+    # The chart's live candle stream (Binance's public kline WebSocket). Off: the chart is
+    # refreshed by polling only. Signals never depend on it either way.
+    chart_stream: bool = True
     # Times in emails are shown in this zone (UTC+8 is Ulaanbaatar).
     display_utc_offset_hours: int = 8
 

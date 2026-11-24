@@ -220,9 +220,13 @@ def test_every_route_needs_a_session_except_the_documented_public_ones(site, mon
 
 def test_a_session_opens_every_route_that_was_closed(site):
     s = site()
+    # Changed on purpose (2026-11-23): loaded first, because /api/candles now answers 503 while the feed
+    # has no candles yet (an empty chart is never served as if it were in order).
+    s.load()
     member = s.member()
     for method, path, _ in walk(s.app.routes):
-        if (method, path) in PUBLIC_ROUTES or path == "/api/stream":  # the stream is endless: tested by its parts
+        # The two streams are endless: tested by their parts (the chart stream was added on 2026-11-23).
+        if (method, path) in PUBLIC_ROUTES or path in ("/api/stream", "/api/candles/stream"):
             continue
         response = member.request(method, fill(path), follow_redirects=False)
         assert response.status_code in (200, 404), f"{method} {path} answered {response.status_code} with a session"
@@ -674,10 +678,15 @@ def test_state_is_the_feeds_snapshot_and_the_smaller_routes_are_parts_of_it(site
     chart, prediction = state.pop("chart"), state.pop("prediction")
     assert steady(state) == steady(strict_json(s.feed.snapshot()))
     # The test source has no intervals of its own: the chart is built from the M15 candles in memory.
+    # Changed on purpose (2026-11-23): "missing", "shortest" and "stream" were added, so the page can say
+    # in words why a timeframe is not there and whether the chart has a live stream.
     assert chart == {
         "timeframes": ["M15", "M30", "M45", "H1", "H2", "H3", "H4", "D1", "W1", "MN1", "MN3", "MN6", "MN12"],
         "signal_timeframe": "M15",
         "filter_timeframe": "H1",
+        "missing": {tf: "no_shorter_candles" for tf in ("M1", "M2", "M3", "M5", "M10")},
+        "shortest": "M15",
+        "stream": {"available": False, "timeframes": []},
     }
     assert prediction == {  # no model file: nothing to draw, and the reason is said
         "available": False, "reason": "no_model", "timeframe": "M15", "horizon_candles": 4, "made_at": None,
@@ -712,7 +721,11 @@ def test_before_the_first_load_the_api_says_starting_and_shows_no_price(site):
     state = member.get("/api/state").json()
     assert state["feed"] == "starting" and state["card"] == {"kind": "starting"}
     assert (state["price"], state["bid"], state["ask"], state["log"]) == (None, None, None, [])
-    assert member.get("/api/candles").json()["bars"] == [] and member.get("/api/signals").json() == []
+    # Changed on purpose (2026-11-23): no candles yet is "nothing right now" (503 with a wait), not an
+    # empty chart that looks in order.
+    candles = member.get("/api/candles")
+    assert candles.status_code == 503 and candles.headers["retry-after"] == "3"
+    assert member.get("/api/signals").json() == []
     assert member.get("/api/signal/latest").json() == {"kind": "starting"}
 
 
@@ -753,10 +766,11 @@ def test_candles_come_oldest_first_in_the_timeframe_and_number_asked_for(site):
     seen = s.source.seen()
 
     def get(query: str = "") -> list[dict[str, Any]]:
-        """The bars of an answer, without their volume (checked on its own below)."""
+        """The bars of an answer."""
         response = member.get(f"/api/candles{query}")
         assert response.status_code == 200
-        return [{key: value for key, value in item.items() if key != "volume"} for item in response.json()["bars"]]
+        # Changed on purpose (2026-11-23): compared with their volume, now that the helpers carry it too.
+        return response.json()["bars"]
 
     assert get() == [bar(row) for row in seen.tail(500).itertuples()]  # M15, 500 by default; the last one is forming
     assert get("?timeframe=M15&limit=1") == [bar(seen.iloc[-1])] and get()[-1]["closed"] is False
@@ -766,9 +780,10 @@ def test_candles_come_oldest_first_in_the_timeframe_and_number_asked_for(site):
     assert s.source.calls == [HISTORY]  # all of it answered from memory
 
     whole = member.get("/api/candles?timeframe=M15&limit=2").json()
+    # "rev" added on purpose (2026-11-23): the history counter the chart stream's events carry as well.
     assert {key: value for key, value in whole.items() if key != "bars"} == {
         "timeframe": "M15", "source": "fake", "symbol": "XAUTEST", "built_from": None,
-        "history": "full", "partial_first": False, "gaps": 0,
+        "history": "full", "partial_first": False, "gaps": 0, "rev": 1,
     }  # fmt: skip
     assert [item["volume"] for item in whole["bars"]] == [float(value) for value in seen["volume"].tail(2)]
     built = member.get("/api/candles?timeframe=M45&limit=4").json()

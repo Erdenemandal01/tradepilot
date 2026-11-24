@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import queue
 import signal
 import threading
 import time
@@ -52,8 +54,89 @@ SECURITY_HEADERS = {
     "cache-control": "no-store",  # prices and the session must never be served from a cache
 }
 KEEP_ALIVE_SECONDS = 15.0
+# The chart's candle stream (GET /api/candles/stream).
+CHART_STREAMS_MAX = 8  # open chart streams at once; one more is answered 503
+CHART_EVENT_SPACING = 0.2  # seconds: at most about five events a second per page, the newest state wins
+CHART_HEARTBEAT = 5.0  # seconds: an event at least this often, so a page can tell "late" from "live"
+CHART_CHECK = 0.5  # seconds between looks at the candles when nothing woke the stream
 
 log = logging.getLogger("tradepilot.web")
+
+
+class DaemonPool:
+    """A few daemon threads that run blocking calls for the event loop and hand back the results.
+
+    Not the event loop's default pool: the interpreter waits for those
+    threads at exit, and a REST request that hangs would then hold Ctrl-C up
+    for its whole timeout. Not a new thread per call either: an open chart
+    stream asks several times a second. Threads are started as needed, never
+    fewer than the calls waiting (up to ``size``), so one call that waits on
+    the source does not hold up another page's.
+    """
+
+    def __init__(self, size: int, name: str) -> None:
+        self._size = max(int(size), 1)
+        self._name = name
+        self._jobs: queue.SimpleQueue = queue.SimpleQueue()
+        self._lock = threading.Lock()
+        self._threads = 0
+        self._waiting = 0  # calls handed in and not finished
+
+    def run(self, function: Callable[..., Any], *args: Any) -> asyncio.Future:
+        """Run ``function(*args)`` on one of the threads; await the returned future for its result."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        with self._lock:
+            self._waiting += 1
+            start = self._threads < min(self._size, self._waiting)
+            if start:
+                self._threads += 1
+        if start:
+            threading.Thread(target=self._work, name=f"{self._name}-{self._threads}", daemon=True).start()
+        self._jobs.put((loop, future, function, args))
+        return future
+
+    def _work(self) -> None:
+        while True:
+            loop, future, function, args = self._jobs.get()
+            try:
+                result, error = function(*args), None
+            except BaseException as failure:  # noqa: BLE001 - handed to the awaiting side
+                result, error = None, failure
+            with self._lock:
+                self._waiting -= 1
+            try:
+                loop.call_soon_threadsafe(_settle, future, result, error)
+            except RuntimeError:  # the loop is gone: the server stopped
+                pass
+
+
+def _settle(future: asyncio.Future, result: Any, error: BaseException | None) -> None:
+    if future.done():
+        return
+    if error is not None:
+        future.set_exception(error)
+    else:
+        future.set_result(result)
+
+
+class ChartStreamResponse(StreamingResponse):
+    """The chart stream's response: its slot among the open chart streams is given back however it ends.
+
+    The slot is taken when the request is accepted (so that streams opened at
+    the same moment cannot pass the limit together) and released here, also
+    when the stream never starts (the page left before the first byte).
+    """
+
+    def __init__(self, content: Any, release: Callable[[], None], **options: Any) -> None:
+        super().__init__(content, **options)
+        self._release = release
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._release()
 
 
 class SecurityHeaders:
@@ -102,17 +185,23 @@ class LoginBody(BaseModel):
     password: str
 
 
-def end_streams_on_exit(feed: Any) -> Callable[[], None]:
+def end_streams_on_exit(*owners: Any) -> Callable[[], None]:
     """End the open streams the moment the server is asked to stop.
 
     The server waits for open connections before it runs any shutdown code,
-    and a dashboard's stream never ends by itself: without this, Ctrl-C would
-    hang for as long as a page is open. Returns the call that undoes it.
+    and a dashboard's streams (the feed's ticks, the chart's candles) never
+    end by themselves: without this, Ctrl-C would hang for as long as a page
+    is open. ``owners`` are the objects whose ``end_streams`` ends them.
+    Returns the call that undoes it.
     """
     previous: dict[int, Any] = {}
 
     def on_signal(number: int, frame: Any) -> None:
-        feed.end_streams()
+        for owner in owners:
+            try:
+                owner.end_streams()
+            except Exception:  # noqa: BLE001 - the server must stop whatever happens here
+                log.exception("ending the open streams failed")
         earlier = previous.get(number)
         if callable(earlier):
             earlier(number, frame)  # the server's own handler: it starts the shutdown
@@ -167,12 +256,22 @@ def create_app(
         ),
     )
     chart = ChartCandles(
-        price_source, feed, refresh_seconds=settings.poll_seconds, history=settings.history_candles
+        price_source,
+        feed,
+        refresh_seconds=settings.poll_seconds,
+        history=settings.history_candles,
+        # The chart's own live stream. The feed never reads it: signals stay on REST polling.
+        stream=settings.chart_stream,
     )
     throttle = auth.Throttle()
     login_lock = threading.Lock()
     secret = settings.session_secret.get_secret_value()
     password_hash = settings.password_hash.get_secret_value()
+    # Sessions ended by "log out" before their time, with that time. Kept in memory: a restart of the
+    # server forgets them (docs/WEB.md, known limits). Pruned as they run out.
+    revoked: dict[str, float] = {}
+    revoked_lock = threading.Lock()
+    chart_pool = DaemonPool(CHART_STREAMS_MAX, "chart-live")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -181,12 +280,13 @@ def create_app(
         if settings.live_enabled if run_feed is None else run_feed:
             thread = threading.Thread(target=feed.run, args=(stop,), name="live-feed", daemon=True)
             thread.start()
-        undo = end_streams_on_exit(feed)
+        undo = end_streams_on_exit(feed, chart)
         try:
             yield
         finally:
             undo()
             stop.set()
+            chart.close(timeout=0.5)  # a stream thread stuck in a connect does not hold Ctrl-C up
             feed.close()
             if thread is not None:
                 thread.join(timeout=5)
@@ -212,7 +312,11 @@ def create_app(
         return JSONResponse({"detail": details}, status_code=422)
 
     def logged_in(request: Request) -> bool:
-        return auth.token_valid(request.cookies.get(auth.COOKIE), secret, time.time())
+        token = request.cookies.get(auth.COOKIE)
+        if not auth.token_valid(token, secret, time.time()):
+            return False
+        with revoked_lock:
+            return token not in revoked
 
     def require_login(request: Request) -> None:
         if not logged_in(request):
@@ -242,10 +346,15 @@ def create_app(
                 throttle.failed(now)
                 raise HTTPException(status_code=401, detail="wrong password")
             throttle.succeeded()
+        token = auth.new_token(secret, now, settings.session_hours)
+        with revoked_lock:
+            # A token names its expiry second: logged out and in again within one second, the new
+            # session has the very token that was logged out. The new login counts.
+            revoked.pop(token, None)
         response = JSONResponse({"ok": True})
         response.set_cookie(
             auth.COOKIE,
-            auth.new_token(secret, now, settings.session_hours),
+            token,
             max_age=int(settings.session_hours * 3600),
             httponly=True,
             samesite="strict",
@@ -260,6 +369,13 @@ def create_app(
         # Only the browser that holds the session can end it. A form on another
         # site is sent without the SameSite=Strict cookie and changes nothing.
         if logged_in(request):
+            token = request.cookies.get(auth.COOKIE) or ""
+            now = time.time()
+            with revoked_lock:
+                for old in [old for old, until in revoked.items() if until <= now]:
+                    del revoked[old]
+                # Ended on the server too: a copy of the token, and the streams opened with it, stop working.
+                revoked[token] = float(token.split(".", 1)[0])
             response.delete_cookie(
                 auth.COOKIE, path="/", httponly=True, samesite="strict", secure=settings.cookie_secure
             )
@@ -306,6 +422,11 @@ def create_app(
                 "timeframes": chart.timeframes(),
                 "signal_timeframe": feed.timeframe,
                 "filter_timeframe": HIGHER,
+                # Each menu timeframe this source cannot show, with the reason as a code.
+                "missing": chart.missing(),
+                "shortest": chart.shortest(),
+                # Whether the chart has a live candle stream here, and which timeframes it moves.
+                "stream": chart.stream_info(),
             },
             # The forecast of the next four M15 closes with its measured record, or why there is none.
             "prediction": feed.prediction(),
@@ -328,6 +449,82 @@ def create_app(
                 detail="the price source gave no candles",
                 headers={"Retry-After": str(int(error.retry_after) + 1)},
             ) from None
+
+    @api.get("/candles/stream")
+    async def candle_stream(request: Request, timeframe: str = feed.timeframe) -> StreamingResponse:
+        """Server-sent events: the chart timeframe's newest bars, live, for as long as the session lasts.
+
+        One ``candles`` event at once, then one whenever the bars (or the
+        history counter, the gaps, the mode) changed, at most one every
+        CHART_EVENT_SPACING seconds with the newest state, and at least one
+        every CHART_HEARTBEAT seconds. Signals never depend on any of this.
+        """
+        if timeframe not in chart.timeframes():
+            raise HTTPException(status_code=422, detail="a timeframe this source can show")
+        loop = asyncio.get_running_loop()
+        # The slot is taken here, counted and checked in one step, and given back when the response
+        # ends however it ends (ChartStreamResponse), also when it never starts.
+        subscriber = chart.subscribe(loop, timeframe, limit=CHART_STREAMS_MAX)
+        if subscriber is None:
+            raise HTTPException(
+                status_code=503, detail="too many open chart streams", headers={"Retry-After": "10"}
+            )
+
+        def release() -> None:
+            chart.unsubscribe(subscriber)
+
+        async def compute(subscriber: Any) -> dict[str, Any] | None:
+            """The event's data, or None when the server began to stop while it was being made."""
+            work = asyncio.ensure_future(chart_pool.run(chart.live, timeframe))
+            ending = asyncio.ensure_future(subscriber.end.wait())
+            try:
+                await asyncio.wait({work, ending}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                ending.cancel()
+            if not work.done():
+                work.cancel()  # the thread finishes on its own; nobody waits for it
+                return None
+            return work.result()
+
+        async def events() -> AsyncIterator[str]:
+            last: Any = None
+            sent_at = -math.inf
+            try:
+                # Checked on every turn: an open stream must not outlive its session or the server.
+                while logged_in(request) and not chart.ending:
+                    chart.watch(timeframe)
+                    subscriber.wake.clear()
+                    data = await compute(subscriber)
+                    if data is None:
+                        break
+                    key = [data[name] for name in ("bars", "mode", "rev", "gaps", "error")]
+                    if key != last or loop.time() - sent_at >= CHART_HEARTBEAT:
+                        spare = CHART_EVENT_SPACING - (loop.time() - sent_at)
+                        if spare > 0:  # too soon after the last event: wait, then send the newest state
+                            await asyncio.sleep(spare)
+                            data = await compute(subscriber)
+                            if data is None:
+                                break
+                            key = [data[name] for name in ("bars", "mode", "rev", "gaps", "error")]
+                        try:
+                            # Strict JSON: a number that is not finite would leave as bare NaN or
+                            # Infinity, which no page can read. Never expected (the candles are checked).
+                            chunk: str | None = f"event: candles\ndata: {json.dumps(data, allow_nan=False)}\n\n"
+                        except ValueError:
+                            log.warning("chart stream %s: an event with a number that is not finite was not sent", timeframe)
+                            chunk = None
+                        if chunk is not None:
+                            yield chunk
+                        last, sent_at = key, loop.time()
+                    pause = min(CHART_CHECK, max(CHART_HEARTBEAT - (loop.time() - sent_at), 0.0))
+                    try:
+                        await asyncio.wait_for(subscriber.wake.wait(), timeout=pause)
+                    except asyncio.TimeoutError:
+                        pass
+            finally:
+                release()
+
+        return ChartStreamResponse(events(), release, media_type="text/event-stream")
 
     @api.get("/signal/latest")
     def latest_signal() -> dict[str, Any]:

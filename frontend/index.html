@@ -130,13 +130,16 @@
 <div class="chart-head">
 <div class="chart-heading">
 <h2 id="chart-title" class="chart-title">XAUUSD · M15</h2>
-<div class="ohlc" aria-label="Лааны үнэ">
-<span id="ohlc-o">O —</span>
-<span id="ohlc-h">H —</span>
-<span id="ohlc-l">L —</span>
-<span id="ohlc-c">C —</span>
+<span id="chart-live" class="live-chip is-wait" title="Графикийн лааны урсгалд холбогдож байна."><span class="shape" aria-hidden="true"></span><span id="chart-live-text">Холбогдож байна</span></span>
+<div class="ohlc" aria-label="Лааны үнэ: нээлт, дээд, доод, хаалт, хэмжээ">
+<span id="ohlc-o" title="Нээлт">O —</span>
+<span id="ohlc-h" title="Дээд">H —</span>
+<span id="ohlc-l" title="Доод">L —</span>
+<span id="ohlc-c" title="Хаалт">C —</span>
+<span id="ohlc-v" title="Арилжааны хэмжээ (эх үүсвэрийн нэгжээр)">V —</span>
 <span id="ohlc-chg" class="ohlc-change"></span>
 <span id="ohlc-forming" class="ohlc-forming" hidden>бүрэлдэж буй</span>
+<span id="ohlc-left" title="Сүүлийн лаа хаагдах хүртэл үлдсэн хугацаа" hidden></span>
 </div>
 </div>
 <div class="tf-controls">
@@ -154,6 +157,10 @@
 <div class="chart-box">
 <div id="chart-el" class="chart-el" role="img" aria-label="XAUUSD лааны график"></div>
 <div id="chart-msg" class="chart-msg">График ачаалж байна</div>
+<button type="button" id="chart-follow" class="chart-follow" title="Хамгийн сүүлийн лаа руу очиж, шинэ лааг дагана" hidden>
+<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M5 12h12"></path><path d="M12 6l6 6-6 6"></path><path d="M20 5v14"></path></svg>
+<span>Шууд ханш руу</span>
+</button>
 </div>
 <div class="forecast-box" role="group" aria-labelledby="forecast-title">
 <div class="forecast-head">
@@ -173,6 +180,8 @@
 <span class="key"><span class="swatch swatch-tp" aria-hidden="true"></span><span>TP</span></span>
 <span class="key"><span class="swatch swatch-sl" aria-hidden="true"></span><span>SL</span></span>
 <span class="key"><span class="swatch swatch-forming" aria-hidden="true"></span><span>Бүрэлдэж буй лаа</span></span>
+<span class="key"><span class="swatch swatch-volume" aria-hidden="true"></span><span>Хэмжээ</span></span>
+<span class="key"><span class="swatch swatch-last" aria-hidden="true"></span><span>Үнийн тэнхлэг дээр: сүүлийн лааны хаалт · хаагдах хүртэл үлдсэн хугацаа (Bid / Ask биш; нарийн дэлгэц дээр хугацаа нь O H L C мөрөнд)</span></span>
 <span class="key" title="M15 дээр дараагийн 4 лааны (60 минут) хаалтын таамаг. Туршилтын тооцоо: сигнал биш, зөвлөгөө биш."><span id="forecast-swatch" class="swatch swatch-forecast is-off" aria-hidden="true"></span><span id="forecast-state">Таамаг бэлэн биш</span></span>
 <span class="dim">Эх үүсвэр: <span data-source="full">—</span>. Брокерын ханшаас зөрж болно.</span>
 </div>
@@ -212,7 +221,7 @@
 </table>
 </div>
 <div id="log-empty" class="empty">Ачаалж байна</div>
-<div class="panel-note">Үр дүнг жишиг үнээс эхлэн <span data-source="name">—</span> ханшаар тооцсон. Таны бодит арилжааны үр дүн биш.</div>
+<div class="panel-note">«TP-д хүрсэн», «SL-д хүрсэн» нь эх үүсвэрийн (<span data-source="name">—</span>) ханш тэр жишиг түвшинд хүрснийг хэлнэ, таны арилжааны үр дүн биш.</div>
 <div class="log-legend">
 <span>Тайлбар:</span>
 <span class="log-legend-item"><span class="tag tag-up">Хүчинтэй</span><span>орох хугацаа дуусаагүй</span></span>

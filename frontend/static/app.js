@@ -2,7 +2,9 @@
  * TradePilot AI: the dashboard page.
  *
  * Shows what the API returns (docs/WEB.md): the snapshot of GET /api/state,
- * the candles of GET /api/candles and the "tick" events of GET /api/stream.
+ * the candles of GET /api/candles, the "tick" events of GET /api/stream and the
+ * chart's own "candles" events of GET /api/candles/stream (the chart only:
+ * signals never depend on it).
  * Signals only: nothing here places, changes or closes an order.
  *
  * Rules kept here:
@@ -32,9 +34,21 @@
   const SNAPSHOT_PAUSE_MS = 5000; // after a failed /api/state: asked again this much later
   const SNAPSHOT_FAILS_SHOWN = 3; // this many failed in a row: the page says so
   const ALERT_FLAG_MS = 60000; // how long "the feed is back" stays in the tab title
-  const TAIL_BARS = 3; // newest candles asked for when the tick does not carry the chart's timeframe
+  const TAIL_BARS = 3; // newest candles asked for while the chart's own stream is silent (not on M15)
   const TAIL_EVERY_MS = 1500;
   const TAIL_FAILS_SHOWN = 3;
+  // The chart's own candle stream (GET /api/candles/stream, docs/WEB.md). It sends an event at
+  // least every 5 s; silent for longer than LIVE_SILENT_MS it no longer draws, and the tick (M15)
+  // or the tail requests (other timeframes) draw instead, as without it.
+  const NARROW_CHART_PX = 480; // a chart narrower than this (a phone) keeps its price axis narrow
+  const HIDDEN_CLOSE_MS = 10000; // a page hidden this long gives its chart stream back (awayLong)
+  const LIVE_SILENT_MS = 8000;
+  const LIVE_RESTART_MS = 20000; // an open chart stream that stays silent this long is opened again
+  const LIVE_PAUSES_MS = [2000, 5000, 10000, 30000]; // before the chart stream is opened again after an error
+  const LIVE_LATE_S = 10; // the newest confirmation of the candles is older than this: "late"
+  const LIVE_DOWN_S = 60; // ... older than this: "down"
+  const FALLBACK_FRESH_MS = 10000; // the tick or a tail answer drew within this: the chart is "by polling"
+  const FIGURE_SPACE = ' '; // as wide as a digit: keeps the price label one width while it counts down
   // Chart timeframes: seconds of the fixed ones, months of the calendar ones.
   const STEP = {
     M1: 60, M2: 120, M3: 180, M5: 300, M10: 600, M15: 900, M30: 1800, M45: 2700,
@@ -83,6 +97,36 @@
     down: '#FB7185',
     upSoft: 'rgba(45, 212, 191, 0.16)', // the body of a candle that is still forming
     downSoft: 'rgba(251, 113, 133, 0.16)',
+    page: '#0B1220',
+    // Volume bars: the candle's colour, dimmer than the candles; dimmer still while it forms.
+    upVolume: 'rgba(45, 212, 191, 0.30)',
+    downVolume: 'rgba(251, 113, 133, 0.30)',
+    upVolumeSoft: 'rgba(45, 212, 191, 0.16)',
+    downVolumeSoft: 'rgba(251, 113, 133, 0.16)',
+  };
+  // Why a menu timeframe cannot be shown (snapshot.chart.missing), in words for its row.
+  const MISSING_WORDS = {
+    no_shorter_candles: function (shortest) {
+      return 'Энэ эх үүсвэрт ' + shortest + ablative(shortest) + ' богино лаа байхгүй';
+    },
+    cannot_build: function () {
+      return 'Энэ эх үүсвэрийн лаагаар бүтээх боломжгүй';
+    },
+  };
+  // The chart's own candle stream, as its state chip says it. Not the feed's status (header).
+  const LIVE_WORDS = {
+    wait: 'холбогдож байна',
+    live: 'шууд урсгал',
+    poll: 'асуулгаар шинэчилж байна',
+    late: 'хоцорч байна',
+    down: 'тасарсан',
+  };
+  const LIVE_HINTS = {
+    wait: 'Графикийн лааны урсгалд холбогдож байна.',
+    live: 'Лаа эх үүсвэрийн шууд урсгалаас (WebSocket) шинэчлэгдэж байна.',
+    poll: 'Лаа сервер эх үүсвэрээс давтан асууж шинэчилж байна (шууд урсгалгүй эсвэл түр тасарсан).',
+    late: 'Сүүлийн шинэчлэлээс хойш удаж байна. Сүүлийн лаа одоогийн ханш биш байж магадгүй.',
+    down: 'Графикийн лаа шинэчлэгдэхгүй байна. Сүүлийн лаа одоогийн ханш биш.',
   };
   // The forecast: the line and its band, full and dimmed. Dimmed is for a model whose
   // measured record is no better than "the price stays where it is".
@@ -98,6 +142,9 @@
   const FORECAST_FAR = 0.2; // a point further from the base price than this share of it: a broken block
   const FORECAST_SCOPE = 'open_market'; // the one kind of record this page has words for
   const MAX_TIME = 4102444800; // 2100-01-01: no real time lies beyond it (the server's own limit)
+  // The server's rule for "better than the baseline" (core/forecast.judge), as far as a record shows it.
+  const FORECAST_MIN_CALLS = 300;
+  const FORECAST_Z95 = 1.96;
 
   const CONDITIONS = {
     trend_ema200: { long: 'Урт хугацааны чиг (EMA200)', short: 'EMA200' },
@@ -164,6 +211,8 @@
     api: null,
     series: null,
     markers: null,
+    volume: null, // the volume bars under the candles (their own price scale at the bottom)
+    label: null, // the price-axis label of the newest candle: its close and the time left (initPriceLabel)
     tf: storedTimeframe(), // the timeframe the user picked: a way of looking, signals do not depend on it
     loadedTf: null, // the timeframe whose candles are in the series
     bars: [], // those candles, times in UTC seconds; closed: false marks the forming one
@@ -171,6 +220,12 @@
     last: {}, // last bar time per timeframe
     favorites: storedFavorites(), // the starred timeframes: quick buttons above the chart
     supported: null, // the timeframes the server can show; null until a snapshot says
+    missing: {}, // timeframe -> reason code, for those the server cannot show (snapshot.chart.missing)
+    shortest: '', // the source's shortest candle (snapshot.chart.shortest)
+    supportKey: '',
+    rev: null, // the history counter that came with the candles on screen (/api/candles rev)
+    retryAt: 0, // Date.now() before which the candles are not asked for again (a 503's Retry-After)
+    unavailable: null, // {until}: the source gives nothing right now (a 503, or the stream's error)
     info: null, // what the last full load said about the history: {history, partialFirst, gaps}
     tailAt: 0,
     tailBusy: false,
@@ -187,10 +242,36 @@
     hover: null,
     forecast: null, // {line, low, high, slots, label}: the forecast's series and its label on the chart
     forecastKey: '', // what the three drawn series hold now; '' when they are empty
+    forecastShown: null, // {p, dim}: the forecast drawn now, for placing its word again
+    wordKey: '', // where the word «Таамаг» is now; '' when it is not drawn
     slotsKey: '', // which future candles the time axis reaches to; '' when none
+    anchored: null, // whether a zoom keeps the right edge (the newest candle in view); see updateFollowButton
+    narrow: false, // the chart is narrow (a phone): the axis label shows the close only, the time left is in the legend
   };
 
   const stream = { source: null, broken: false, timer: null, delay: 2000, restartedAt: 0 };
+
+  /*
+   * The chart's own candle stream: one EventSource for the timeframe on screen. While it delivers
+   * it is the chart's only writer; while it is silent or broken the tick (M15) and the tail
+   * requests (other timeframes) draw, as they did without it.
+   */
+  const live = {
+    started: false, // boot has opened the streams: before that nothing opens this one
+    source: null,
+    tf: null, // the timeframe of that source
+    timer: null, // the pause before it is opened again after an error
+    pause: 0, // index into LIVE_PAUSES_MS
+    openedAt: 0,
+    restartedAt: 0,
+    lastWall: 0, // Date.now() when its last event arrived
+    data: null, // that event: {mode, at, age, error, retryAfter, bars}
+    gaps: null, // its gap count, to compare with the next event's
+    fallbackWall: 0, // Date.now() when the tick or a tail answer last drew while the stream was silent
+    fallbackAt: null, // the server's time of that
+    stateKey: '',
+    hiddenSince: document.hidden ? Date.now() : null, // Date.now() when the page was last hidden; null while shown
+  };
 
   // fails: /api/state requests failed in a row; timer: the retry after a failed one
   const snapshotJob = { busy: false, queued: false, retryAt: 0, fails: 0, timer: null };
@@ -224,6 +305,13 @@
 
   function pad2(value) {
     return String(value).padStart(2, '0');
+  }
+
+  /* The ablative ending ("-аас" = than / from) after a timeframe code, by how its last number is read. */
+  function ablative(code) {
+    const endings = ['аас', 'ээс', 'оос', 'аас', 'өөс', 'аас', 'аас', 'оос', 'аас', 'өөс'];
+    const digit = /(\d)$/.exec(String(code));
+    return '-' + (digit ? endings[Number(digit[1])] : 'аас');
   }
 
   /* A value of a lookup table by a key that may come from the server: own keys only. */
@@ -399,6 +487,16 @@
     return pad2(d.getUTCMonth() + 1) + '.' + pad2(d.getUTCDate());
   }
 
+  /* "16:30:05", with the date in front when the moment is not on the same day as ``now``. */
+  function fmtStampSec(seconds, now) {
+    if (!isNum(seconds)) {
+      return DASH;
+    }
+    const d = shifted(seconds);
+    const clock = pad2(d.getUTCHours()) + ':' + pad2(d.getUTCMinutes()) + ':' + pad2(d.getUTCSeconds());
+    return isNum(now) && dayIndex(seconds) !== dayIndex(now) ? fmtDay(seconds) + ' ' + clock : clock;
+  }
+
   function fmtDateTime(seconds) {
     const d = shifted(seconds);
     return d.getUTCFullYear() + '.' + fmtDay(seconds) + ' ' + pad2(d.getUTCHours()) + ':' + pad2(d.getUTCMinutes());
@@ -421,6 +519,41 @@
 
   function fmtPrice(value) {
     return isNum(value) ? value.toFixed(2) : DASH;
+  }
+
+  /* A candle's volume as the source gave it (base units); a dash when it gave none. */
+  function fmtVolume(value) {
+    if (!isNum(value)) {
+      return DASH;
+    }
+    if (value >= 10000) {
+      return String(Math.round(value)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    }
+    return value.toFixed(value >= 100 ? 1 : 2);
+  }
+
+  /*
+   * The time left until a candle of ``tf`` closes, in one width per timeframe (so the price
+   * label does not change width while it counts): mm:ss up to H1, h:mm:ss up to D1, days for
+   * weeks and months (h:mm:ss in their last day). Zero when the time is up.
+   */
+  function fmtLeft(left, tf) {
+    const total = Math.max(0, Math.ceil(left));
+    const months = pick(MONTHS, tf);
+    const step = months === undefined ? STEP[tf] : null;
+    if (step === null || tf === 'W1') {
+      if (total >= 86400) {
+        const width = { W1: 1, MN1: 2, MN3: 2, MN6: 3, MN12: 3 }[tf] || 1;
+        return String(Math.floor(total / 86400)).padStart(width, FIGURE_SPACE) + ' хоног';
+      }
+    }
+    const minutes = Math.floor(total / 60);
+    const seconds = total % 60;
+    if (step !== null && step <= 3600) {
+      return pad2(minutes) + ':' + pad2(seconds);
+    }
+    const hourDigits = step !== null && step < 86400 ? String(Math.floor(step / 3600)).length : 2;
+    return String(Math.floor(total / 3600)).padStart(hourDigits, '0') + ':' + pad2(minutes % 60) + ':' + pad2(seconds);
   }
 
   function fmtSigned(value, digits) {
@@ -523,6 +656,7 @@
     }
     state.leaving = true;
     closeStream();
+    closeChartStream();
     if (state.snap === null) {
       window.location.assign('/login'); // never got in: nothing was running that could stop
       return;
@@ -576,7 +710,11 @@
     const answer = (async function () {
       const response = await request(path, controller ? { signal: controller.signal } : undefined);
       if (!response.ok) {
-        throw new Error('HTTP ' + response.status);
+        const failure = new Error('HTTP ' + response.status);
+        failure.status = response.status;
+        const wait = Number(response.headers && response.headers.get ? response.headers.get('Retry-After') : NaN);
+        failure.retryAfter = isNum(wait) && wait >= 0 ? wait : null; // a 503 says when to ask again
+        throw failure;
       }
       return response.json();
     })();
@@ -864,6 +1002,9 @@
     if (chart.series && chart.loadedTf !== chart.tf) {
       requestCandles(); // a load of the candles failed: keep trying
     }
+    safe(checkChartStream);
+    safe(renderLiveState); // live / by polling / late / down, judged by the clock as well
+    safe(updatePriceLabel); // the time left until the newest candle closes
     safe(renderClock);
     safe(paintTitle); // a flag in the tab title ends by the clock, with or without ticks
   }
@@ -993,10 +1134,20 @@
     const tick = state.tick;
     const notes = []; // [kind, icon, words]
     let broken = true;
+    const own = liveState().kind; // the chart's own candles: another timeframe can move while the feed is down
     if (state.lost && tick) {
       notes.push(['down', 'warn', 'Сервертэй холбоо тасарсан. График шинэчлэгдэхгүй байна.']);
-    } else if (tick && tick.feed === 'down') {
+    } else if (tick && tick.feed === 'down' && (chart.tf === state.timeframe || own === 'late' || own === 'down')) {
       notes.push(['down', 'warn', 'Ханш тасарсан. Сүүлийн лаа шинэчлэгдэхгүй байна.']);
+    } else if (chart.unavailable) {
+      // A 503 or the stream's "unavailable": the source gives nothing right now. Not "too short a history".
+      notes.push([
+        'down',
+        'warn',
+        'Эх үүсвэр ' + chart.tf + ' лааг одоогоор өгөхгүй байна (түр саатал).' +
+          (chart.bars.length ? ' Дэлгэц дээрх сүүлийн лаа шинэчлэгдэхгүй байна.' : '') +
+          ' Дахин оролдож байна.',
+      ]);
     } else if (chart.tailFails >= TAIL_FAILS_SHOWN) {
       notes.push([
         'down',
@@ -1835,9 +1986,172 @@
     return out;
   }
 
-  /* A bar as the page keeps it. Only the server's own `closed: false` makes a candle a forming one. */
+  /*
+   * A bar as the page keeps it. Only the server's own `closed: false` makes a candle a forming one.
+   * Volume: a number, or null when the source gave none (the tick's bars carry none).
+   */
   function barOf(row) {
-    return { time: row.time, open: row.open, high: row.high, low: row.low, close: row.close, closed: row.closed !== false };
+    return {
+      time: row.time,
+      open: row.open,
+      high: row.high,
+      low: row.low,
+      close: row.close,
+      volume: isNum(row.volume) && row.volume >= 0 ? row.volume : null,
+      closed: row.closed !== false,
+    };
+  }
+
+  /* The volume bar of a candle; a candle without volume data gets none (a gap, not a zero). */
+  function volumeBar(bar) {
+    if (bar.volume === null) {
+      return { time: toChartTime(bar.time) };
+    }
+    const rising = bar.close >= bar.open;
+    let color = rising ? COLOR.upVolume : COLOR.downVolume;
+    if (bar.closed === false) {
+      color = rising ? COLOR.upVolumeSoft : COLOR.downVolumeSoft;
+    }
+    return { time: toChartTime(bar.time), value: bar.volume, color: color };
+  }
+
+  /*
+   * A row of an update as a bar. A row without a volume field (a tick from a server older than this
+   * page) keeps the volume the page holds for that candle: no field means "not said", not "none".
+   */
+  function updateBar(row) {
+    const bar = barOf(row);
+    if (!Object.prototype.hasOwnProperty.call(row, 'volume')) {
+      const at = chart.index.get(row.time);
+      if (at !== undefined) {
+        bar.volume = chart.bars[at].volume;
+      }
+    }
+    return bar;
+  }
+
+  /* Whether a kept bar and a bar of an update differ in anything that is drawn. */
+  function barDiffers(kept, bar) {
+    return (
+      kept.open !== bar.open ||
+      kept.high !== bar.high ||
+      kept.low !== bar.low ||
+      kept.close !== bar.close ||
+      kept.volume !== bar.volume ||
+      kept.closed !== bar.closed
+    );
+  }
+
+  /*
+   * The volume bars: a histogram on a scale of its own in the lowest fifth of the chart, so it
+   * never changes the candles' price range. No label and no line on the price axis.
+   */
+  function initVolume(LWC) {
+    chart.volume = chart.api.addSeries(LWC.HistogramSeries, {
+      priceScaleId: 'volume',
+      priceFormat: { type: 'volume' },
+      priceLineVisible: false,
+      lastValueVisible: false,
+      base: 0,
+    });
+    chart.api.priceScale('volume').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+  }
+
+  /*
+   * The newest candle's label on the right price axis: its close and the time left until it
+   * closes ("3626.03 · 00:22"), in place of the library's own last-value label. A series
+   * primitive's axis view: the library places it, moves it clear of the TP / SL labels and makes
+   * the axis wide enough for it. Coloured like the candle while the chart's candles are current,
+   * grey while they are late or down.
+   */
+  function initPriceLabel() {
+    const label = { series: null, redraw: null, price: null, text: '', back: COLOR.raised, color: COLOR.dim, key: '' };
+    const view = {
+      coordinate: function () {
+        const y = label.series && label.price !== null ? label.series.priceToCoordinate(label.price) : null;
+        return isNum(y) ? y : -1000;
+      },
+      text: function () {
+        return label.text;
+      },
+      textColor: function () {
+        return label.color;
+      },
+      backColor: function () {
+        return label.back;
+      },
+      visible: function () {
+        return label.text !== '' && label.price !== null;
+      },
+      tickVisible: function () {
+        return true;
+      },
+    };
+    const views = [view]; // the same array every time: the library caches by it
+    label.primitive = {
+      attached: function (param) {
+        label.series = param.series;
+        label.redraw = param.requestUpdate;
+      },
+      detached: function () {
+        label.series = null;
+        label.redraw = null;
+      },
+      updateAllViews: function () {},
+      priceAxisViews: function () {
+        return views;
+      },
+    };
+    chart.series.attachPrimitive(label.primitive);
+    chart.series.applyOptions({ lastValueVisible: false }); // this label takes the place of the library's
+    chart.label = label;
+  }
+
+  /* The label's text and colour now; asked again every second for the countdown. */
+  function updatePriceLabel() {
+    const label = chart.label;
+    if (!label) {
+      return;
+    }
+    const last = chart.loadedTf === chart.tf && chart.bars.length ? chart.bars[chart.bars.length - 1] : null;
+    let text = '';
+    let back = COLOR.raised;
+    let color = COLOR.dim;
+    // On a narrow chart (a phone) the label with the time left would take a third of the width:
+    // the axis then shows the close only, and the time left goes into the O H L C row.
+    const host = $('chart-el');
+    const narrow = Boolean(host) && host.clientWidth > 0 && host.clientWidth < NARROW_CHART_PX;
+    let leftText = '';
+    if (last) {
+      const now = estimatedNow();
+      // A closed newest candle has no time left: zeros, in the same width, until the next one comes.
+      const left = now === null ? null : last.closed === false ? nextOpen(last.time, chart.tf) - now : 0;
+      leftText = left === null ? '' : fmtLeft(left, chart.tf);
+      text = fmtPrice(last.close) + (leftText === '' || narrow ? '' : ' · ' + leftText);
+      const kind = liveState().kind;
+      if (kind === 'live' || kind === 'poll') {
+        back = last.close >= last.open ? COLOR.up : COLOR.down;
+        color = COLOR.page;
+      }
+    }
+    label.price = last ? last.close : null;
+    chart.narrow = narrow;
+    const leftNode = $('ohlc-left');
+    if (leftNode) {
+      setText(leftNode, narrow && leftText !== '' ? 'хаагдах хүртэл ' + leftText : '');
+      show(leftNode, narrow && leftText !== '');
+    }
+    const key = text + '|' + back + '|' + label.price;
+    if (key === label.key) {
+      return;
+    }
+    label.key = key;
+    label.text = text;
+    label.back = back;
+    label.color = color;
+    if (label.redraw) {
+      label.redraw();
+    }
   }
 
   function validBar(bar) {
@@ -1902,7 +2216,8 @@
           attributionLogo: true, // the licence asks for the attribution
         },
         grid: { vertLines: { color: COLOR.grid }, horzLines: { color: COLOR.grid } },
-        rightPriceScale: { borderColor: COLOR.border, scaleMargins: { top: 0.12, bottom: 0.12 } },
+        // The candles keep the lower fifth for the volume bars, which have a scale of their own.
+        rightPriceScale: { borderColor: COLOR.border, scaleMargins: { top: 0.1, bottom: 0.22 } },
         timeScale: {
           borderColor: COLOR.border,
           timeVisible: true,
@@ -1916,20 +2231,12 @@
           horzLine: { color: COLOR.dim, labelBackgroundColor: COLOR.raised },
         },
         localization: { timeFormatter: crosshairTime, priceFormatter: fmtPrice },
-        // A vertical swipe over the chart scrolls the page; a horizontal one moves the chart.
+        // As on TradingView (the owner asked for it): the plain mouse wheel over the chart zooms it,
+        // a sideways wheel or a drag moves it, a pinch zooms on a phone. A vertical swipe on a
+        // phone still scrolls the page; the chart takes horizontal ones.
         handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
+        handleScale: { mouseWheel: true, pinch: true, axisPressedMouseMove: true, axisDoubleClickReset: true },
       });
-      // The mouse wheel scrolls the page as everywhere else. With Ctrl held (or a pinch on a
-      // touchpad) it zooms the chart; a sideways wheel moves the chart.
-      host.addEventListener(
-        'wheel',
-        function (event) {
-          if (!event.ctrlKey && !event.metaKey && Math.abs(event.deltaY) >= Math.abs(event.deltaX)) {
-            event.stopPropagation();
-          }
-        },
-        { capture: true, passive: true }
-      );
       chart.series = chart.api.addSeries(LWC.CandlestickSeries, {
         upColor: COLOR.up,
         downColor: COLOR.down,
@@ -1960,10 +2267,23 @@
       safe(function () {
         initForecastSeries(LWC);
       });
+      // Added after the forecast's series, each on its own: a failure here costs that part only.
+      safe(function () {
+        initVolume(LWC);
+      });
+      safe(initPriceLabel);
+      safe(function () {
+        // Whether the newest candle is in view decides the «Шууд ханш руу» button.
+        chart.api.timeScale().subscribeVisibleLogicalRangeChange(function () {
+          safe(updateFollowButton);
+        });
+      });
     } catch (error) {
       chart.api = null;
       chart.series = null;
       chart.markers = null;
+      chart.volume = null;
+      chart.label = null;
       chartMessage('График ачаалагдсангүй. Хуудсыг дахин ачаална уу.');
       if (window.console && console.error) {
         console.error(error);
@@ -2000,11 +2320,19 @@
         partialFirst: Boolean(body && body.partial_first === true),
         gaps: body && isNum(body.gaps) ? body.gaps : 0,
       };
+      chart.rev = body && isNum(body.rev) ? body.rev : null; // the chart stream's `rev` is compared with it
       chart.tailFails = 0;
+      chart.unavailable = null;
       setBars(tf, bars, resetView);
       safe(renderChartNote);
     } catch (error) {
       if (token === chart.request) {
+        if (error && error.status === 503) {
+          // Nothing right now: asked again after the server's Retry-After, and said in words.
+          const wait = isNum(error.retryAfter) ? Math.min(Math.max(error.retryAfter, 1), 60) : 5;
+          chart.retryAt = Date.now() + wait * 1000;
+          chart.unavailable = { until: chart.retryAt };
+        }
         if (error && error.message === 'HTTP 422' && tf !== state.timeframe) {
           // The server cannot show this timeframe (another source than when it was picked):
           // back to the signal timeframe, which every source has.
@@ -2019,8 +2347,13 @@
         // known time on, and the candle that missed its close would stay wrong for good.
         chart.stale = true;
         if (!(error instanceof AuthError) && chart.bars.length === 0) {
-          chartMessage('Лааны түүхийг татаж чадсангүй. Дахин оролдож байна.');
+          chartMessage(
+            error && error.status === 503
+              ? 'Эх үүсвэр ' + tf + ' лааг одоогоор өгөхгүй байна (түр саатал). Дахин оролдож байна.'
+              : 'Лааны түүхийг татаж чадсангүй. Дахин оролдож байна.'
+          );
         }
+        safe(renderChartNote);
       }
     } finally {
       if (token === chart.request) {
@@ -2031,13 +2364,21 @@
 
   /* The guarded form: used by the gap check, a stream reconnect and a page that became visible. */
   function requestCandles() {
-    if (!chart.series || chart.loading || Date.now() - chart.startedAt < CANDLE_PAUSE_MS) {
+    if (!chart.series || chart.loading || Date.now() - chart.startedAt < CANDLE_PAUSE_MS || Date.now() < chart.retryAt) {
       return;
     }
     loadCandles(chart.loadedTf !== chart.tf); // nothing on screen yet: start at the newest candle
   }
 
   function setBars(tf, bars, resetView) {
+    // A reload of the same timeframe (a gap, a moved history counter, a new display zone) keeps
+    // what the user looks at: the same candles in view at the same zoom.
+    let keep = null;
+    if (!resetView && chart.loadedTf === tf) {
+      safe(function () {
+        keep = captureView();
+      });
+    }
     chart.stale = false; // a fresh load answers every gap seen so far
     chart.shift = state.offset * 3600;
     chart.bars = bars;
@@ -2049,10 +2390,21 @@
     chart.last[tf] = bars.length ? bars[bars.length - 1].time : null;
     chart.hover = null;
     chart.series.setData(bars.map(chartBar));
+    safe(function () {
+      if (chart.volume) {
+        chart.volume.setData(bars.map(volumeBar));
+      }
+    });
     safe(syncForecastSlots); // before the view is reset: the time axis is complete then
     if (resetView && bars.length) {
       chart.api.timeScale().resetTimeScale(); // the newest candles at the default zoom
+    } else if (keep) {
+      safe(function () {
+        restoreView(keep);
+      });
     }
+    safe(updatePriceLabel);
+    safe(updateFollowButton);
     chartMessage(
       bars.length
         ? ''
@@ -2077,16 +2429,22 @@
   }
 
   /*
-   * The newest bars of a tick. The tick carries the signal timeframe and H1; for any
-   * other timeframe on screen its newest candles are asked for (requestTail).
+   * The newest bars of a tick, used only while the chart's own stream is silent or broken (one
+   * writer). One origin per timeframe: the tick's M15 bars are the feed's own candles, as is the
+   * M15 history, so they may be drawn on M15. Its H1 bars are the filter's view, built from the
+   * feed's M15 candles, while the H1 history comes from the source's own 1h candles: they are
+   * never drawn. Any timeframe but M15 asks for its newest candles instead (requestTail).
    */
   function applyBars(tickBars) {
-    if (!chart.series || !tickBars || typeof tickBars !== 'object') {
+    if (!chart.series || !tickBars || typeof tickBars !== 'object' || liveDrawing()) {
       return;
     }
     const tf = chart.tf;
-    if (Array.isArray(tickBars[tf])) {
-      applyList(tf, tickBars[tf]);
+    if (tf === state.timeframe) {
+      if (Array.isArray(tickBars[tf])) {
+        applyList(tf, tickBars[tf], 'tick');
+      }
+      // ({} while the feed is down: nothing moves then.)
     } else if (Object.keys(tickBars).length > 0) {
       // ({} while the feed is down: nothing moves then.)
       if (chart.loadedTf !== tf) {
@@ -2097,17 +2455,18 @@
     }
   }
 
-  /* The newest candles of a timeframe the tick does not carry. One request at a time, never a queue. */
+  /* The newest candles of a timeframe while its chart stream is silent. One request at a time, never a queue. */
   async function requestTail() {
     const tf = chart.tf;
-    if (chart.tailBusy || chart.loading || state.leaving || chart.loadedTf !== tf) {
+    // Not while the page has been hidden for a while: nobody looks, and the history is loaded again when it shows.
+    if (chart.tailBusy || chart.loading || state.leaving || chart.loadedTf !== tf || awayLong()) {
       return;
     }
     if (chart.stale) {
       requestCandles(); // a candle on screen missed its close: the whole history, not a tail
       return;
     }
-    if (Date.now() - chart.tailAt < TAIL_EVERY_MS) {
+    if (Date.now() - chart.tailAt < TAIL_EVERY_MS || Date.now() < chart.retryAt) {
       return;
     }
     chart.tailBusy = true;
@@ -2115,13 +2474,22 @@
     const token = chart.request; // a new choice or a reload makes this answer an old one
     try {
       const body = await getJSON('/api/candles?timeframe=' + encodeURIComponent(tf) + '&limit=' + TAIL_BARS);
-      if (token === chart.request && !chart.loading && chart.loadedTf === tf) {
+      if (token === chart.request && !chart.loading && chart.loadedTf === tf && !liveDrawing()) {
         chart.tailFails = 0;
-        applyList(tf, body && Array.isArray(body.bars) ? body.bars : []);
+        chart.unavailable = null;
+        if (isNum(body && body.rev) && isNum(chart.rev) && body.rev !== chart.rev) {
+          chart.stale = true; // older candles changed on the server: the whole history again
+        }
+        applyList(tf, body && Array.isArray(body.bars) ? body.bars : [], 'tail');
       }
     } catch (error) {
       if (token === chart.request) {
         chart.tailFails += 1;
+        if (error && error.status === 503) {
+          const wait = isNum(error.retryAfter) ? Math.min(Math.max(error.retryAfter, 1), 60) : 5;
+          chart.retryAt = Date.now() + wait * 1000;
+          chart.unavailable = { until: chart.retryAt };
+        }
       }
     } finally {
       chart.tailBusy = false;
@@ -2129,8 +2497,16 @@
     }
   }
 
-  /* Bars of a tick or of a tail request. Only bars at or after the last known time are passed on. */
-  function applyList(tf, list) {
+  /*
+   * Bars of the chart stream, a tick or a tail request (``via``: 'stream', 'tick', 'tail'), oldest
+   * first. The candle on screen and the next one are drawn with update(): the forming candle moves
+   * in place, a candle that closes keeps its final values and the next one is added once. An
+   * older candle of the list may only get its final values (a closed one whose values were
+   * confirmed after the close); it never becomes a forming one again. A list that starts after
+   * the candle on screen, or jumps over a candle, is a missed close: the whole history is loaded
+   * again.
+   */
+  function applyList(tf, list, via) {
     if (!chart.series || tf !== chart.tf || !Array.isArray(list) || list.length === 0) {
       return;
     }
@@ -2145,17 +2521,39 @@
     }
     // When the list no longer carries the candle we hold, that candle never got its close: load again.
     let reload = validBar(list[0]) && list[0].time > last;
+    let added = false;
     for (const row of list) {
-      if (!validBar(row) || row.time < last) {
+      if (!validBar(row)) {
+        continue;
+      }
+      if (row.time < last) {
+        const at = chart.index.get(row.time);
+        const bar = updateBar(row);
+        if (at !== undefined && row.closed !== false && barDiffers(chart.bars[at], bar)) {
+          try {
+            chart.series.update(chartBar(bar), true); // an existing candle that is not the newest
+            if (chart.volume) {
+              chart.volume.update(volumeBar(bar), true);
+            }
+          } catch (error) {
+            reload = true;
+            break;
+          }
+          chart.bars[at] = bar;
+        }
         continue;
       }
       if (row.time > nextOpen(last, tf)) {
         reload = true; // a gap: more than one candle ahead
         break;
       }
-      const bar = barOf(row);
+      const bar = updateBar(row);
+      const isNew = !chart.index.has(bar.time);
       try {
         chart.series.update(chartBar(bar));
+        if (chart.volume) {
+          chart.volume.update(volumeBar(bar));
+        }
       } catch (error) {
         reload = true;
         break;
@@ -2163,16 +2561,355 @@
       rememberBar(bar);
       last = bar.time;
       chart.last[tf] = last;
+      added = added || isNew;
+    }
+    if (via !== 'stream') {
+      live.fallbackWall = Date.now(); // the chart moves by the tick or by tail requests now
+      live.fallbackAt = via === 'tick' && state.tick && isNum(state.tick.now) ? state.tick.now : estimatedNow();
     }
     if (reload) {
       chart.stale = true;
     }
     if (chart.stale) {
-      requestCandles(); // asked again on every tick until a load succeeds
+      requestCandles(); // asked again on every update until a load succeeds
+    }
+    if (added) {
+      safe(updateMarkers); // a signal's marker may sit on the candle that just opened
+      safe(updateFollowButton);
     }
     if (chart.hover === null) {
       renderLegend();
     }
+    safe(updatePriceLabel);
+  }
+
+  // ------------------------------------------------- the chart's own candle stream
+
+  /* Whether the chart stream delivers now for the timeframe on screen: then it alone draws. */
+  function liveDrawing() {
+    const source = live.source;
+    return (
+      Boolean(source) &&
+      typeof window.EventSource === 'function' &&
+      source.readyState === window.EventSource.OPEN &&
+      live.tf === chart.tf &&
+      live.data !== null &&
+      live.data.error === null &&
+      live.data.bars.length > 0 &&
+      Date.now() - live.lastWall < LIVE_SILENT_MS
+    );
+  }
+
+  /*
+   * The state of the chart's own candles, apart from the feed's status in the header:
+   * {kind: 'wait' | 'live' | 'poll' | 'late' | 'down', at: the source's time of the newest update or null}.
+   */
+  function liveState() {
+    const data = live.data;
+    const now = Date.now();
+    const at = data && data.tf === chart.tf ? data.at : null;
+    if (state.lost) {
+      return { kind: 'down', at: newestAt(at) };
+    }
+    if (data && data.tf === chart.tf && now - live.lastWall < LIVE_SILENT_MS && live.source && live.tf === chart.tf) {
+      if (data.error !== null) {
+        return { kind: 'down', at: at };
+      }
+      if (data.age === null) {
+        return { kind: 'wait', at: at };
+      }
+      const age = data.age + (now - live.lastWall) / 1000;
+      if (age > LIVE_DOWN_S) {
+        return { kind: 'down', at: at };
+      }
+      if (age > LIVE_LATE_S) {
+        return { kind: 'late', at: at };
+      }
+      return { kind: data.mode === 'stream' ? 'live' : 'poll', at: at };
+    }
+    // The chart stream is silent or broken: the tick (M15) or tail requests keep the chart.
+    const fallback = live.fallbackWall > 0 && chart.loadedTf === chart.tf;
+    if (fallback && now - live.fallbackWall < FALLBACK_FRESH_MS && !chart.unavailable) {
+      return { kind: 'poll', at: newestAt(at) };
+    }
+    if (!fallback && !(data && data.tf === chart.tf)) {
+      return { kind: chart.unavailable ? 'down' : 'wait', at: null };
+    }
+    const quiet = now - Math.max(live.lastWall, live.fallbackWall);
+    const down = chart.unavailable || chart.tailFails >= TAIL_FAILS_SHOWN || quiet > LIVE_DOWN_S * 1000;
+    return { kind: down ? 'down' : 'late', at: newestAt(at) };
+  }
+
+  function newestAt(at) {
+    const fallback = chart.loadedTf === chart.tf ? live.fallbackAt : null;
+    if (isNum(at) && isNum(fallback)) {
+      return Math.max(at, fallback);
+    }
+    return isNum(at) ? at : isNum(fallback) ? fallback : null;
+  }
+
+  /* The chip beside the chart's title: the real source and symbol, and the state of its candles. */
+  function renderLiveState() {
+    const chip = $('chart-live');
+    if (!chip) {
+      return;
+    }
+    const now = estimatedNow();
+    const seen = liveState();
+    let words = LIVE_WORDS[seen.kind];
+    if (seen.kind !== 'live' && seen.kind !== 'wait' && isNum(seen.at)) {
+      words += ' · сүүлд ' + fmtStampSec(seen.at, now);
+    }
+    const text = sourceFull() + ' · ' + words;
+    const key = seen.kind + '|' + text;
+    if (key === live.stateKey) {
+      return;
+    }
+    live.stateKey = key;
+    const className = 'live-chip is-' + seen.kind;
+    if (chip.className !== className) {
+      chip.className = className;
+    }
+    setText($('chart-live-text'), text);
+    chip.title = LIVE_HINTS[seen.kind];
+    safe(updatePriceLabel); // its colour follows the state
+    safe(renderChartNote);
+  }
+
+  /* One chart stream event (docs/WEB.md "The chart's live stream"). Only the newest choice's are used. */
+  function onChartEvent(source, raw) {
+    if (source !== live.source) {
+      return;
+    }
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch (error) {
+      return;
+    }
+    if (!data || typeof data !== 'object' || data.timeframe !== live.tf || live.tf !== chart.tf) {
+      return;
+    }
+    const bars = Array.isArray(data.bars) ? data.bars.filter(validBar) : [];
+    if (bars.some(function (bar) { return candleOpen(bar.time, live.tf) !== bar.time; })) {
+      return; // not candles of this timeframe: nothing of another origin is drawn under its title
+    }
+    const error = data.error === null || data.error === undefined ? null : String(data.error);
+    live.pause = 0;
+    live.lastWall = Date.now();
+    live.data = {
+      tf: live.tf,
+      mode: data.mode === 'stream' ? 'stream' : 'poll',
+      at: isNum(data.at) ? data.at : null,
+      age: isNum(data.age) ? data.age : null,
+      error: error,
+      retryAfter: isNum(data.retry_after) ? data.retry_after : null,
+      bars: bars,
+    };
+    if (error !== null) {
+      // The source gives nothing right now: nothing is drawn as current, and it is said in words.
+      const wait = live.data.retryAfter !== null ? Math.min(Math.max(live.data.retryAfter, 1), 60) : 5;
+      chart.unavailable = { until: Date.now() + wait * 1000 };
+    } else {
+      chart.unavailable = null;
+      chart.tailFails = 0;
+      // Candles older than the newest three changed on the server (a refill after a reconnect, a
+      // reload, a hole that healed), or the number of holes did: the history is loaded again, with
+      // the view kept. Until a load succeeds every event asks again (chart.stale).
+      if (chart.loadedTf === live.tf) {
+        if (isNum(data.rev) && isNum(chart.rev) && data.rev !== chart.rev) {
+          chart.stale = true;
+        }
+        if (isNum(data.gaps) && live.gaps !== null && data.gaps !== live.gaps) {
+          chart.stale = true;
+        }
+      }
+      if (isNum(data.gaps)) {
+        live.gaps = data.gaps;
+      }
+      if (bars.length) {
+        applyList(live.tf, bars, 'stream');
+      } else if (chart.stale) {
+        requestCandles();
+      }
+    }
+    safe(renderLiveState);
+    safe(renderChartNote);
+  }
+
+  /*
+   * Whether the page has been hidden for longer than HIDDEN_CLOSE_MS. A browser allows about six
+   * connections to one server over HTTP/1.1, and every tab keeps its tick stream open (signals are
+   * announced from hidden tabs too): a tab hidden that long gives its chart stream back, makes no
+   * tail requests, and opens the stream again when it shows. A short hide (switching tabs for a
+   * moment, a page shown for an instant) changes nothing.
+   */
+  function awayLong() {
+    return document.hidden && live.hiddenSince !== null && Date.now() - live.hiddenSince > HIDDEN_CLOSE_MS;
+  }
+
+  /* Open the chart stream for the timeframe on screen (one at a time; the old one is closed). */
+  function openChartStream() {
+    if (!live.started || state.leaving || !chart.series || typeof window.EventSource !== 'function' || awayLong()) {
+      return;
+    }
+    const tf = chart.tf;
+    if (live.source && live.tf === tf && live.source.readyState !== window.EventSource.CLOSED) {
+      return;
+    }
+    closeChartStream();
+    let source;
+    try {
+      source = new window.EventSource('/api/candles/stream?timeframe=' + encodeURIComponent(tf));
+    } catch (error) {
+      scheduleChartReopen();
+      return;
+    }
+    live.source = source;
+    live.tf = tf;
+    live.openedAt = Date.now();
+    source.addEventListener('candles', function (event) {
+      safe(function () {
+        onChartEvent(source, event.data);
+      });
+    });
+    source.addEventListener('error', function () {
+      if (live.source !== source) {
+        return;
+      }
+      // Reconnecting by itself (the browser does after a drop) or given up (an error answer:
+      // 401, 422, 503): the tick or tail requests draw meanwhile.
+      safe(renderLiveState);
+      if (source.readyState === window.EventSource.CLOSED) {
+        scheduleChartReopen();
+      }
+    });
+  }
+
+  function closeChartStream() {
+    if (live.timer !== null) {
+      window.clearTimeout(live.timer);
+      live.timer = null;
+    }
+    if (live.source) {
+      live.source.close();
+      live.source = null;
+    }
+  }
+
+  /* After an error answer: a pause that grows (2, 5, 10, 30 s), then a snapshot (it finds a session that ended) and a new stream. */
+  function scheduleChartReopen() {
+    if (live.timer !== null || state.leaving) {
+      return;
+    }
+    const pause = LIVE_PAUSES_MS[Math.min(live.pause, LIVE_PAUSES_MS.length - 1)];
+    live.pause += 1;
+    live.timer = window.setTimeout(async function () {
+      live.timer = null;
+      await refreshSnapshot(); // goes to /login when the session has ended
+      openChartStream();
+    }, pause);
+  }
+
+  /* Every second: a chart stream that is missing, given up or silent for long is opened again. */
+  function checkChartStream() {
+    if (!live.started || state.leaving || !chart.series || typeof window.EventSource !== 'function') {
+      return;
+    }
+    if (awayLong()) {
+      if (live.source) {
+        closeChartStream(); // a tab hidden for a while holds no chart stream (see awayLong)
+      }
+      return;
+    }
+    const source = live.source;
+    if (!source || source.readyState === window.EventSource.CLOSED || live.tf !== chart.tf) {
+      if (live.timer === null) {
+        openChartStream();
+      }
+      return;
+    }
+    const quiet = Date.now() - Math.max(live.lastWall, live.openedAt);
+    if (source.readyState === window.EventSource.OPEN && quiet > LIVE_RESTART_MS && Date.now() - live.restartedAt > LIVE_RESTART_MS) {
+      live.restartedAt = Date.now();
+      closeChartStream();
+      openChartStream();
+    }
+  }
+
+  // ------------------------------------------------- the view: zoom, scrolling, «Шууд ханш руу»
+
+  /*
+   * What the user looks at, to keep it across a reload of the candles: following the newest
+   * candle (its distance from the right edge), or a place in the history (the candle at the
+   * left edge, by its time, and the width in candles).
+   */
+  function captureView() {
+    if (!chart.api || !chart.bars.length) {
+      return null;
+    }
+    const scale = chart.api.timeScale();
+    if (!(scale.width() > 0)) {
+      return null; // not laid out (a hidden page): there is no view to keep
+    }
+    const range = scale.getVisibleLogicalRange();
+    const first = scale.timeToIndex(toChartTime(chart.bars[0].time), false);
+    const last = scale.timeToIndex(toChartTime(chart.bars[chart.bars.length - 1].time), false);
+    if (!range || !isNum(range.from) || !isNum(range.to) || !(range.to > range.from) || !isNum(first) || !isNum(last)) {
+      return null;
+    }
+    if (range.to >= last) {
+      return { following: true, position: scale.scrollPosition() };
+    }
+    const at = Math.max(0, Math.min(chart.bars.length - 1, Math.round(range.from) - first));
+    return { following: false, time: chart.bars[at].time, offset: range.from - (first + at), width: range.to - range.from };
+  }
+
+  function restoreView(view) {
+    const scale = chart.api.timeScale();
+    if (view.following) {
+      scale.scrollToPosition(view.position, false);
+      return;
+    }
+    const index = scale.timeToIndex(toChartTime(view.time), true);
+    if (isNum(index)) {
+      scale.setVisibleLogicalRange({ from: index + view.offset, to: index + view.offset + view.width });
+    }
+  }
+
+  /* «Шууд ханш руу» is shown while the newest candle is out of view. */
+  function updateFollowButton() {
+    const button = $('chart-follow');
+    if (!button) {
+      return;
+    }
+    let away = false;
+    if (chart.api && chart.bars.length && chart.loadedTf === chart.tf) {
+      const scale = chart.api.timeScale();
+      const range = scale.getVisibleLogicalRange();
+      const index = scale.timeToIndex(toChartTime(chart.bars[chart.bars.length - 1].time), false);
+      away = Boolean(range) && isNum(index) && (index > range.to || index < range.from);
+      const axis = chart.api.priceScale('right').width();
+      if (away && isNum(axis) && axis > 0) {
+        button.style.setProperty('--axis-width', Math.round(axis) + 'px'); // just left of the price axis
+      }
+      // While the newest candle is in view, a zoom (wheel, pinch) keeps the right edge where it is,
+      // as on TradingView: zooming in never pushes the newest candle out and stops the following.
+      // Scrolled into the history, a zoom centres on the pointer.
+      if (chart.anchored !== !away) {
+        chart.anchored = !away;
+        scale.applyOptions({ rightBarStaysOnScroll: !away });
+      }
+    }
+    show(button, away);
+  }
+
+  /* Back to the newest candle at the same zoom; from there the chart follows new candles again. */
+  function onFollowClick() {
+    if (chart.api) {
+      chart.api.timeScale().scrollToRealTime();
+    }
+    safe(updateFollowButton);
   }
 
   function updateMarkers() {
@@ -2284,6 +3021,7 @@
           high: data.high,
           low: data.low,
           close: data.close,
+          volume: kept ? kept.volume : null,
           closed: !kept || kept.closed !== false,
         };
       }
@@ -2292,7 +3030,7 @@
     renderLegend();
   }
 
-  /* O H L C and the change from the previous close: the bar under the crosshair, otherwise the last bar. */
+  /* O H L C V and the change from the previous close: the bar under the crosshair, otherwise the last bar. */
   function renderLegend() {
     const bars = chart.bars;
     let bar = chart.hover;
@@ -2313,6 +3051,7 @@
       setText($('ohlc-h'), 'H ' + DASH);
       setText($('ohlc-l'), 'L ' + DASH);
       setText($('ohlc-c'), 'C ' + DASH);
+      setText($('ohlc-v'), 'V ' + DASH);
       setText(change, '');
       return;
     }
@@ -2320,6 +3059,7 @@
     setText($('ohlc-h'), 'H ' + fmtPrice(bar.high));
     setText($('ohlc-l'), 'L ' + fmtPrice(bar.low));
     setText($('ohlc-c'), 'C ' + fmtPrice(bar.close));
+    setText($('ohlc-v'), 'V ' + fmtVolume(bar.volume));
     const delta = bar.close - (previous ? previous.close : bar.open);
     setText(change, fmtSigned(delta));
     const className = 'ohlc-change ' + (delta < 0 ? 'tone-down' : 'tone-up');
@@ -2340,6 +3080,7 @@
     if (host) {
       host.setAttribute('aria-label', subject + ' ' + chart.tf + ' лааны график');
     }
+    safe(renderLiveState); // the chip names the source too
   }
 
   /* Day, week and month candles carry a date on the time axis, shorter ones a time of day. */
@@ -2364,7 +3105,11 @@
         const choose = el('button', 'tf-choose');
         choose.type = 'button';
         choose.setAttribute('data-pick', item[0]);
-        choose.append(el('span', 'tf-words', item[1]), el('span', 'tf-code', item[0]));
+        const main = el('span', 'tf-main');
+        const why = el('span', 'tf-why'); // why this source cannot show it, in words (renderTimeframes)
+        why.hidden = true;
+        main.append(el('span', 'tf-words', item[1]), why);
+        choose.append(main, el('span', 'tf-code', item[0]));
         const star = el('button', 'tf-star');
         star.type = 'button';
         star.setAttribute('data-star', item[0]);
@@ -2422,11 +3167,26 @@
         choose.removeAttribute('aria-current');
       }
       choose.disabled = !able;
-      choose.title = able ? '' : 'Энэ эх үүсвэр уг хугацааг өгдөггүй';
+      const reason = able ? '' : missingWords(tf);
+      choose.title = reason;
+      const why = row.querySelector('.tf-why');
+      if (why) {
+        setText(why, reason);
+        why.hidden = able;
+      }
       star.setAttribute('aria-pressed', starred ? 'true' : 'false');
       star.setAttribute('aria-label', name + (starred ? ': дуртайгаас хасах' : ': дуртайд нэмэх'));
       star.title = starred ? 'Дуртайгаас хасах' : 'Дуртайд нэмэх';
     }
+  }
+
+  /* Why this source cannot show ``tf``: the server's reason code (snapshot.chart.missing) in words. */
+  function missingWords(tf) {
+    const words = pick(MISSING_WORDS, pick(chart.missing, tf));
+    if (words) {
+      return words(chart.shortest || state.timeframe);
+    }
+    return 'Энэ эх үүсвэр уг хугацааг өгдөггүй';
   }
 
   /* A star only changes the list of quick buttons. The chart and the picked timeframe stay as they are. */
@@ -2529,15 +3289,29 @@
 
   /* What the server says it can show. A timeframe picked earlier that this source lacks falls back. */
   function syncSupported() {
-    const list = state.snap && state.snap.chart && state.snap.chart.timeframes;
+    const info = state.snap && state.snap.chart;
+    const list = info && info.timeframes;
     if (!Array.isArray(list)) {
       return;
     }
     const next = list.filter(knownTf);
-    if (chart.supported !== null && chart.supported.join(',') === next.join(',')) {
+    const missing = {};
+    if (info.missing && typeof info.missing === 'object') {
+      for (const tf of TF_ORDER) {
+        if (typeof pick(info.missing, tf) === 'string') {
+          missing[tf] = info.missing[tf];
+        }
+      }
+    }
+    const shortest = knownTf(info.shortest) ? info.shortest : '';
+    const key = JSON.stringify([next, missing, shortest]);
+    if (chart.supported !== null && key === chart.supportKey && chart.supported.join(',') === next.join(',')) {
       return;
     }
+    chart.supportKey = key;
     chart.supported = next;
+    chart.missing = missing;
+    chart.shortest = shortest;
     renderTimeframes();
     if (!tfSupported(chart.tf) && next.length) {
       pickTimeframe(tfSupported(state.timeframe) ? state.timeframe : next[0]);
@@ -2615,6 +3389,13 @@
     };
     // The word on the chart itself, at the end of the line. A dot and a word, not an arrow: not a signal.
     chart.forecast.label = LWC.createSeriesMarkers(chart.forecast.line, [], { autoScale: false });
+    // A zoom or a scroll changes how far the forecast's points are from the TP and SL labels.
+    chart.api.timeScale().subscribeVisibleLogicalRangeChange(function () {
+      safe(placeForecastWord);
+    });
+    chart.api.timeScale().subscribeSizeChange(function () {
+      safe(placeForecastWord);
+    });
   }
 
   /* Open times of the candles a forecast made now is about: the forming candle and the three after it. */
@@ -2690,10 +3471,34 @@
     if (skill.scope !== FORECAST_SCOPE || (skill.hit_rate_baseline_call !== 'up' && skill.hit_rate_baseline_call !== 'down')) {
       return null;
     }
-    if (skill.better_than_baseline && !(skill.mae < skill.baseline_mae && skill.calls > 0 && skill.hit_rate > 0.5)) {
+    if (
+      skill.better_than_baseline &&
+      !(
+        skill.mae < skill.baseline_mae &&
+        skill.calls >= FORECAST_MIN_CALLS &&
+        skill.hit_rate > 0.5 &&
+        hitRateFloor(Math.round(skill.hit_rate * skill.calls), skill.calls) > 0.5
+      )
+    ) {
       return null; // it claims an edge that its own numbers do not show
     }
     return skill;
+  }
+
+  /*
+   * Lower 95% bound (Wilson) of a hit rate, the same sum as core/forecast.hit_rate_floor: calls one
+   * candle apart overlap, so they count as calls / FORECAST_POINTS tries.
+   */
+  function hitRateFloor(hits, calls) {
+    const tries = calls / FORECAST_POINTS;
+    if (!(tries > 0)) {
+      return 0;
+    }
+    const rate = hits / calls;
+    const z = FORECAST_Z95;
+    const centre = rate + (z * z) / (2 * tries);
+    const spread = z * Math.sqrt((rate * (1 - rate)) / tries + (z * z) / (4 * tries * tries));
+    return (centre - spread) / (1 + (z * z) / tries);
   }
 
   /*
@@ -2792,19 +3597,155 @@
       return;
     }
     chart.forecastKey = '';
+    chart.forecastShown = null;
+    chart.wordKey = '';
     chart.forecast.label.setMarkers([]);
     chart.forecast.line.setData([]);
     chart.forecast.low.setData([]);
     chart.forecast.high.setData([]);
   }
 
+  /*
+   * Where the word «Таамаг» goes: on one of the forecast's points, above or below it. The TP and
+   * SL labels sit at the right edge of the chart, and so does the end of the forecast, so the word
+   * at the end could be half covered by one of them (seen with a TP near the last point). Sizes in
+   * CSS pixels for the chart's 11 px font, measured on the page, with a margin: the word is about
+   * 37 wide and lies 10 to 22 from its point; a TP / SL box is about 23 wide and 15 tall at the
+   * chart's right edge. The chart moves a label by up to its own height, away from the other
+   * one, when it would overlap another label (the live price, or the other level), so such a
+   * label is taken to reach that much further on that side.
+   */
+  const WORD_HALF_WIDTH = 22;
+  const WORD_NEAR = 8;
+  const WORD_FAR = 24;
+  const LEVEL_BOX_WIDTH = 28;
+  const LEVEL_BOX_HEIGHT = 16;
+
+  /* The boxes the TP and SL labels can take on the chart, in CSS pixels; [] when they are not drawn. */
+  function levelBoxes() {
+    const levels = chart.levels;
+    if (!levels || !chart.api || !chart.series) {
+      return [];
+    }
+    const width = chart.api.timeScale().width();
+    const last = chart.bars[chart.bars.length - 1];
+    const ys = [levels.min, levels.max].map(function (price) {
+      return chart.series.priceToCoordinate(price);
+    });
+    const others = ys.concat(last ? [chart.series.priceToCoordinate(last.close)] : []);
+    if (!isNum(width) || !ys.every(isNum)) {
+      return null; // not laid out yet: no pixel answer
+    }
+    return ys.map(function (y, i) {
+      const box = { left: width - LEVEL_BOX_WIDTH, top: y - LEVEL_BOX_HEIGHT / 2, bottom: y + LEVEL_BOX_HEIGHT / 2 };
+      others.forEach(function (other, j) {
+        if (j === i || !isNum(other) || Math.abs(other - y) >= LEVEL_BOX_HEIGHT) {
+          return;
+        }
+        // Crowded: the label is moved away from the other one (either way when they are level).
+        if (other <= y) {
+          box.bottom += LEVEL_BOX_HEIGHT;
+        }
+        if (other >= y) {
+          box.top -= LEVEL_BOX_HEIGHT;
+        }
+      });
+      return box;
+    });
+  }
+
+  /*
+   * The first place where the word is clear of every TP / SL box: the last point, then the ones
+   * before it, each first on the side the line does not come from, then the line's start (the
+   * close it was made from), first on the side away from the signal's arrows. Without a signal
+   * (no TP / SL on the chart): the last point. When no place is clear, or the
+   * chart cannot say where things are, the last point on the side with more room before the next
+   * TP or SL line (in price).
+   */
+  function forecastWordPlace(p) {
+    const points = p.points;
+    const end = points[points.length - 1];
+    const down = end.close < p.base_price;
+    const last = { time: end.time, side: down ? 'belowBar' : 'aboveBar', price: end.close };
+    if (!chart.levels) {
+      return last;
+    }
+    const boxes = levelBoxes();
+    if (boxes) {
+      const places = points
+        .map(function (point) {
+          return { time: point.time, price: point.close, first: last.side };
+        })
+        .reverse();
+      // At the start the word shares its candle with that candle's signal arrow, if it has one:
+      // SELL arrows stand above the candles, BUY arrows below.
+      const card = state.tick && state.tick.card;
+      const arrows = card && card.kind === 'signal' ? card.side : null;
+      const start = arrows === 'SELL' ? 'belowBar' : arrows === 'BUY' ? 'aboveBar' : down ? 'aboveBar' : 'belowBar';
+      places.push({ time: p.made_at - STEP[FORECAST_TF], price: p.base_price, first: start });
+      for (const place of places) {
+        const x = chart.api.timeScale().timeToCoordinate(toChartTime(place.time));
+        const y = chart.series.priceToCoordinate(place.price);
+        if (!isNum(x) || !isNum(y)) {
+          continue;
+        }
+        for (const side of place.first === 'aboveBar' ? ['aboveBar', 'belowBar'] : ['belowBar', 'aboveBar']) {
+          const top = side === 'aboveBar' ? y - WORD_FAR : y + WORD_NEAR;
+          const bottom = side === 'aboveBar' ? y - WORD_NEAR : y + WORD_FAR;
+          const covered = boxes.some(function (box) {
+            return x + WORD_HALF_WIDTH > box.left && bottom > box.top && top < box.bottom;
+          });
+          if (!covered) {
+            return { time: place.time, side: side };
+          }
+        }
+      }
+    }
+    let above = Infinity;
+    let below = Infinity;
+    for (const level of [chart.levels.min, chart.levels.max]) {
+      if (level > end.close) {
+        above = Math.min(above, level - end.close);
+      } else if (level < end.close) {
+        below = Math.min(below, end.close - level);
+      }
+    }
+    return { time: end.time, side: above === below ? last.side : above > below ? 'aboveBar' : 'belowBar' };
+  }
+
+  /* Put the word where forecastWordPlace says; again after a zoom, a scroll or a new tick. */
+  function placeForecastWord() {
+    const shown = chart.forecastShown;
+    if (!chart.forecast || !shown) {
+      return;
+    }
+    const place = forecastWordPlace(shown.p);
+    const key = [chart.forecastKey, place.time, place.side].join('|');
+    if (key === chart.wordKey) {
+      return;
+    }
+    chart.wordKey = key;
+    chart.forecast.label.setMarkers([
+      {
+        time: toChartTime(place.time),
+        position: place.side,
+        shape: 'circle',
+        size: 0.5,
+        color: shown.dim ? FORECAST_COLOR.lineDim : FORECAST_COLOR.line,
+        text: 'Таамаг',
+      },
+    ]);
+  }
+
   function drawForecastSeries(p, dim) {
+    chart.forecastShown = { p: p, dim: dim };
     const parts = [chart.shift, dim ? 1 : 0, p.made_at, p.base_price];
     for (const point of p.points) {
       parts.push(point.time, point.close, point.low, point.high);
     }
     const key = parts.join('|');
     if (key === chart.forecastKey) {
+      placeForecastWord(); // the price scale or the TP / SL lines may have moved
       return;
     }
     // All three start on the last closed candle's close, the price the forecast was made from.
@@ -2824,18 +3765,8 @@
     chart.forecast.line.setData(line);
     chart.forecast.low.setData(low);
     chart.forecast.high.setData(high);
-    const end = p.points[p.points.length - 1];
-    chart.forecast.label.setMarkers([
-      {
-        time: toChartTime(end.time),
-        position: end.close < p.base_price ? 'belowBar' : 'aboveBar', // on the side the line does not come from
-        shape: 'circle',
-        size: 0.5,
-        color: dim ? FORECAST_COLOR.lineDim : FORECAST_COLOR.line,
-        text: 'Таамаг',
-      },
-    ]);
     chart.forecastKey = key;
+    placeForecastWord();
   }
 
   function fmtDate(seconds) {
@@ -3001,6 +3932,12 @@
     writeStore(STORE.tf, tf);
     chart.info = null;
     chart.tailFails = 0;
+    chart.rev = null;
+    chart.retryAt = 0;
+    chart.unavailable = null;
+    live.gaps = null;
+    live.fallbackWall = 0;
+    live.fallbackAt = null;
     renderTimeframes();
     updateTitle();
     applyTimeScale();
@@ -3012,13 +3949,24 @@
       chart.index = new Map();
       chart.hover = null;
       chart.series.setData([]);
+      safe(function () {
+        if (chart.volume) {
+          chart.volume.setData([]);
+        }
+      });
       if (chart.markers) {
         chart.markers.setMarkers([]);
       }
       renderLegend();
+      safe(updatePriceLabel);
+      safe(updateFollowButton);
       chartMessage('График ачаалж байна');
       loadCandles(true);
+      // The chart stream of the new timeframe; the old one's events are no longer drawn.
+      live.pause = 0;
+      openChartStream();
     }
+    safe(renderLiveState);
     safe(syncForecast); // another timeframe, or M15 not loaded yet: no line until it fits again
   }
 
@@ -3407,6 +4355,7 @@
     }
     state.leaving = true;
     closeStream();
+    closeChartStream();
     if (state.leaveTimer !== null) {
       // The session had ended and the page was about to leave by itself: one navigation, this one.
       window.clearTimeout(state.leaveTimer);
@@ -3467,6 +4416,7 @@
     $('sound-btn').addEventListener('click', onSoundClick);
     $('logout-btn').addEventListener('click', onLogout);
     $('email-test').addEventListener('click', onEmailTest);
+    $('chart-follow').addEventListener('click', onFollowClick);
 
     const touched = function () {
       notif.interacted = true;
@@ -3479,8 +4429,12 @@
     window.addEventListener('focus', clearTitle);
     document.addEventListener('visibilitychange', function () {
       if (document.visibilityState !== 'visible') {
+        if (live.hiddenSince === null) {
+          live.hiddenSince = Date.now(); // the chart stream is given back if it stays hidden (awayLong)
+        }
         return;
       }
+      live.hiddenSince = null;
       if (document.hasFocus()) {
         clearTitle();
       }
@@ -3489,18 +4443,24 @@
         refreshSnapshot();
       }
       checkStream();
+      safe(checkChartStream);
       safe(renderNotifyButton);
     });
-    window.addEventListener('online', checkStream);
+    window.addEventListener('online', function () {
+      checkStream();
+      safe(checkChartStream);
+    });
     window.addEventListener('pagehide', function (event) {
       if (!event.persisted) {
         closeStream();
+        closeChartStream();
       }
     });
     window.addEventListener('pageshow', function (event) {
       if (event.persisted && !state.leaving) {
         stream.broken = true;
         checkStream();
+        safe(checkChartStream);
       }
     });
   }
@@ -3520,6 +4480,8 @@
     loadCandles(true); // GET /api/candles for the timeframe picked last time, at the same time
     await first;
     openStream(); // then the live stream
+    live.started = true;
+    openChartStream(); // and the chart's own candle stream for the timeframe on screen
   }
 
   boot();

@@ -16,6 +16,11 @@ Rules kept here:
 - A candle is decided once. Whatever the source answers later (a copy that is
   behind, a candle that is missing from one answer, a whole-history reload),
   a decision already made stays exactly as it was made.
+- An answer without candles, or with candles that end before the ones the
+  feed has, is not fresh data: the cycle counts as failed and the stored
+  candles stay.
+- The feed's clock follows the source forward. An old quote does not turn it
+  back: such a quote shows with its age.
 - Signals only: this module reads prices and sends messages, nothing else.
 - The forecast (backend/app/forecast.py) is made after the signals of a cycle
   are decided and announced. It never changes them, and an error in it costs
@@ -57,17 +62,24 @@ LATE_POLLS = 2.5  # with a slow poll: this many poll intervals instead, when tha
 LATE_CAP = 0.75  # but never later than this share of stale_after_seconds, so "late" always comes before "down"
 HOLE_QUIET = 60.0  # seconds: the same hole is not reloaded for, or said, again within this time
 HOLE_AGE = 86400  # seconds: a hole younger than this is asked for again each time a candle closes
+BEHIND_QUIET = 60.0  # seconds of nothing but answers that end before the stored candles before the source is believed
+CLOCK_PERIOD = 3600.0  # seconds in which no quote was ahead of the clock before the clock is set back
 REFUSED = (418, 429)
 HIGHER = fl.HIGHER_TIMEFRAME
 
 
-def _bar(row: Any) -> dict[str, float | int]:
+class SourceBehind(DataSourceError):
+    """The answer's candles end before the candles the feed already has: a copy of the source that is behind."""
+
+
+def _bar(row: Any) -> dict[str, float | int | None]:
     return {
         "time": int(row.time),
         "open": float(row.open),
         "high": float(row.high),
         "low": float(row.low),
         "close": float(row.close),
+        "volume": None if math.isnan(row.volume) else float(row.volume),  # None: the source gave none
         "closed": bool(row.closed),  # False: the candle is still forming
     }
 
@@ -120,10 +132,19 @@ class LiveFeed:
         self._hole_said: dict[tuple[int, int], float] = {}  # when each hole was last there (the feed's stopwatch)
         self._hole_reloads: dict[tuple[int, int], float] = {}  # when the history was last reloaded for each hole
         self._heal_refused: DataSourceError | None = None  # the source refused the longer tail in this cycle
+        self._behind_since: float | None = None  # when the answers began to end before the stored candles
+        self._behind_logged = -math.inf  # when that was last written to the server log
         self._quote: Quote | None = None
         self._quote_at = 0.0
-        self._source_time: float | None = None  # newest time the source has reported
-        self._source_time_at = 0.0
+        self._source_time: float | None = None  # a time the source reported: what the clock runs on from
+        self._source_time_at = 0.0  # when that quote arrived (the feed's stopwatch)
+        # The newest time stamp among the quotes behind the clock since it was last set: a quote that is
+        # not newer than that is a repeat and says nothing new about the time.
+        self._clock_newest = -math.inf
+        # The freshest quote since the clock was last set, as (its time, when it arrived), and when
+        # the first quote that was behind the clock arrived: see _set_clock.
+        self._clock_fresh: tuple[float, float] | None = None
+        self._clock_period_at: float | None = None
         self._fingerprint: tuple | None = None
         self._started_at = timer()
         self._activity_at: float | None = None
@@ -144,9 +165,10 @@ class LiveFeed:
     def now(self) -> float:
         """Current UTC time, by the source's own clock when it gives one.
 
-        The newest time the source has reported plus the time passed since.
-        Only a newer time moves it: when the source repeats an old answer this
-        clock keeps running, and the answer's age shows.
+        A time the source reported plus the time passed since. A quote that
+        is ahead of this clock moves it forward. When the source repeats an
+        old answer, or the first quote after a silence is an old one, the
+        clock keeps running and the quote's age shows (see ``_set_clock``).
         """
         if self._source_time is not None:
             return self._source_time + (self._timer() - self._source_time_at)
@@ -232,15 +254,17 @@ class LiveFeed:
         # The quote is asked for at the same moment as the candles, not after them.
         quote = self._side_request.submit(self._source.fetch_quote)
         try:
-            frame = self._source.fetch_candles(self.timeframe, self._history if reload else TAIL)
+            frame = self._ask(self._history if reload else TAIL)
             if stored is not None:
+                self._bear_behind(stored, frame)
                 merged, news = cd.lay_over(stored, frame, self.timeframe)
                 pairs = [(gap.after, gap.before) for gap in news]
                 if merged is None or (pairs and not self._reloaded_lately(pairs)):
                     # The tail does not connect, or a candle is missing that was not missing before.
                     reload = True
                     self._note_reload(pairs)
-                    frame = self._source.fetch_candles(self.timeframe, self._history)
+                    frame = self._ask(self._history)
+                    self._behind_since = None  # the stored candles are the source's own again
                 else:
                     # A hole the history was reloaded for less than a minute ago is borne as the
                     # source gives it: its answers disagree, and asking for everything again
@@ -251,6 +275,31 @@ class LiveFeed:
                 quote.exception()
             raise
         return frame, quote.result(), reload
+
+    def _ask(self, limit: int) -> pd.DataFrame:
+        """The newest ``limit`` candles. An answer without a single candle is not data: it fails the cycle."""
+        frame = self._source.fetch_candles(self.timeframe, limit)
+        if frame.empty:
+            raise DataSourceError(f"the source answered a request for {limit} candles with none")
+        return frame
+
+    def _bear_behind(self, stored: pd.DataFrame, frame: pd.DataFrame) -> None:
+        """Fail the cycle when the tail ends before the stored candles, instead of following it back.
+
+        Copies of a source can answer in turn, one of them a candle behind.
+        Such an answer brings nothing new: the stored candles stay, the cycle
+        counts as failed, and the feed's age runs on from the last answer
+        that was right. Only when nothing else has come for a minute is the
+        source believed: the caller then loads the history as it is now.
+        """
+        if int(frame["time"].iloc[-1]) >= int(stored["time"].iloc[-1]):
+            self._behind_since = None
+            return
+        now = self._timer()
+        if self._behind_since is None:
+            self._behind_since = now
+        if now - self._behind_since < BEHIND_QUIET:
+            raise SourceBehind("the source answered with candles that end before the ones it gave earlier")
 
     def _reloaded_lately(self, pairs: list[tuple[int, int]]) -> bool:
         now = self._timer()
@@ -278,7 +327,7 @@ class LiveFeed:
         if reach <= TAIL:
             return merged
         try:
-            healed, news = cd.lay_over(merged, self._source.fetch_candles(self.timeframe, reach), self.timeframe)
+            healed, news = cd.lay_over(merged, self._ask(reach), self.timeframe)
         except (DataSourceError, ValueError) as error:
             log.info("live feed: the longer tail for a hole gave nothing: %s", error)
             if isinstance(error, DataSourceError) and error.status in REFUSED:
@@ -291,7 +340,14 @@ class LiveFeed:
     def _failed(self, error: DataSourceError) -> float:
         with self._lock:
             self._failures += 1
-            if self._failures in (1, 10) or self._failures % 100 == 0:
+            loud = self._failures in (1, 10) or self._failures % 100 == 0
+            if isinstance(error, SourceBehind):
+                # Copies that answer in turn would write this line every few seconds: once a minute is enough.
+                now = self._timer()
+                loud = now - self._behind_logged >= BEHIND_QUIET
+                if loud:
+                    self._behind_logged = now
+            if loud:
                 log.warning("live feed: fetch failed (%d in a row): %s", self._failures, error)
             if error.status in REFUSED:
                 self._refusals += 1
@@ -312,8 +368,8 @@ class LiveFeed:
         # The quote first: every alert below is then stamped by the source's clock.
         self._quote = quote
         self._quote_at = self._timer()
-        if quote.timed_by_source and (self._source_time is None or quote.time > self._source_time):
-            self._source_time, self._source_time_at = quote.time, self._quote_at
+        if quote.timed_by_source:
+            self._set_clock(quote.time, self._quote_at)
 
         last = frame.iloc[-1]
         volume = float(last["volume"])
@@ -397,6 +453,49 @@ class LiveFeed:
             kept = {d.result.signal_time for d in self._decisions}
             self._outcomes = {key: value for key, value in self._outcomes.items() if key in kept}
         self._forecast(frame)
+
+    def _set_clock(self, time: float, at: float) -> None:
+        """Let a quote's own time move the feed's clock: forward at once, back only on long evidence.
+
+        A quote ahead of the running clock sets it. An older one does not:
+        after a silence the first quote can be minutes old (a copy of the
+        source that lags), and a clock set back by it would make that price
+        look fresh and an expired signal look valid. The quote's age is
+        judged against the clock as it ran before.
+
+        A clock that could only go forward would stay wrong for good after
+        one quote dated ahead, and the stopwatch of a PC that runs a little
+        fast would carry it ahead of the source over the days. So the clock
+        does go back, but only to the freshest quote of a whole
+        ``CLOCK_PERIOD`` in which not one quote was ahead of it. A quote that
+        is repeated says nothing new about the time and does not count.
+
+        The period starts with the first quote behind the clock, judged
+        against the quotes since the clock was last set, not against every
+        quote ever seen: after one quote dated ahead (a glitch), the right
+        quotes that follow are all older than it, and judged against it they
+        would not count until real time had caught up with the glitch. So the
+        feed reads down for an hour after such a quote, whatever its size.
+        """
+        if self._source_time is None:
+            self._source_time, self._source_time_at = time, at
+            return
+        if time >= self._source_time + (at - self._source_time_at):
+            self._source_time, self._source_time_at = time, at
+            # The evidence against the clock starts anew.
+            self._clock_fresh, self._clock_period_at, self._clock_newest = None, None, -math.inf
+            return
+        if time <= self._clock_newest:
+            return  # a repeat
+        self._clock_newest = time
+        fresh = self._clock_fresh
+        if fresh is None or time - at >= fresh[0] - fresh[1]:
+            self._clock_fresh = (time, at)
+        if self._clock_period_at is None:
+            self._clock_period_at = at
+        if at - self._clock_period_at >= CLOCK_PERIOD:
+            self._source_time, self._source_time_at = self._clock_fresh
+            self._clock_fresh, self._clock_period_at, self._clock_newest = None, None, -math.inf
 
     def _note_holes(self, frame: pd.DataFrame) -> None:
         """Keep the holes of the stored history by name, and say a new one once.

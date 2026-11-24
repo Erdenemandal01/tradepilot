@@ -133,6 +133,13 @@ def test_a_good_model_file_is_read_with_its_record(tmp_path, stored):
                             "calls_up": 100}}
         ),  # fmt: skip
         lambda s: json.dumps({**s, "skill": {**s["skill"], "better_than_baseline": True, "mae": 2.0, "hit_rate": 0.5}}),
+        # The rule's third condition worked out from the record itself: a hit rate above a coin's, but its
+        # lower 95% bound is not (0.51 on 400 calls, and 0.55 on 300 calls, whose bound is about 0.44).
+        lambda s: json.dumps({**s, "skill": {**s["skill"], "better_than_baseline": True, "mae": 2.0, "hit_rate": 0.51}}),
+        lambda s: json.dumps(
+            {**s, "skill": {**s["skill"], "better_than_baseline": True, "mae": 2.0, "hit_rate": 0.55, "calls": 300,
+                            "calls_up": 200}}
+        ),  # fmt: skip
         # A hit rate without a single call.
         lambda s: json.dumps({**s, "skill": {**s["skill"], **NO_CALLS, "hit_rate": 0.5}}),
         lambda s: json.dumps({**s, "skill": {**s["skill"], **NO_CALLS, "hit_rate_baseline": 0.52}}),

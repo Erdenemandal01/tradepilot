@@ -7,9 +7,10 @@ quotes as ``Quote``. When a source cannot deliver real data it raises
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Protocol
 
 import pandas as pd
 
@@ -50,12 +51,64 @@ class Quote:
         return self.ask - self.bid
 
 
+@dataclass(frozen=True)
+class StreamCandle:
+    """One update of a candle from a live stream, in the shape of a row of a candle frame.
+
+    ``closed`` is the exchange's own flag: True once the candle has ended and
+    these are its final values. ``event_time`` is when the exchange sent the
+    update, UTC seconds by its clock.
+    """
+
+    time: int  # open time, UTC seconds
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float  # NaN when the source gives none
+    closed: bool
+    event_time: float
+
+    def bar(self) -> dict[str, Any]:
+        """The row for ``core.candles.lay_stream``."""
+        return {
+            "time": self.time,
+            "open": self.open,
+            "high": self.high,
+            "low": self.low,
+            "close": self.close,
+            "volume": self.volume,
+            "closed": self.closed,
+        }
+
+
+class CandleStream(Protocol):
+    """An open live stream of one timeframe's candles. Used by one thread."""
+
+    def read(self, timeout: float) -> StreamCandle | None:
+        """The next update, or None when none came within ``timeout`` seconds.
+
+        Raises DataSourceError when the stream is broken; it is then closed
+        and a new one must be opened.
+        """
+
+    def close(self) -> None:
+        """End the stream. Safe to call from another thread and more than once."""
+
+
 class DataSource(ABC):
     name: str
     symbol: str
     # Candle lengths the chart may ask this source for directly, besides the
     # signal timeframe. Empty: the chart is built from the signal candles only.
     chart_timeframes: tuple[str, ...] = ()
+    # Candle lengths this source can push live (``open_candle_stream``). Empty:
+    # no stream, the chart is refreshed by polling. Never used for signals.
+    stream_timeframes: tuple[str, ...] = ()
+
+    def open_candle_stream(self, timeframe: str) -> CandleStream:
+        """Open a live stream of ``timeframe`` candles. DataSourceError when it cannot be opened."""
+        raise NotImplementedError(f"the {self.name} source has no live candle stream")
 
     @abstractmethod
     def fetch_candles(self, timeframe: str, limit: int = 500) -> pd.DataFrame:
@@ -84,14 +137,18 @@ def check_limit(limit: int, maximum: int) -> None:
 
 
 def to_float(value: Any, what: str) -> float:
+    """A finite number from a response. NaN and infinity are never data (Python's json reads both)."""
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        raise DataSourceError(f"bad {what} in response: {value!r}") from None
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise DataSourceError(f"bad {what} in response: {str(value)[:50]!r}") from None
+    if not math.isfinite(number):
+        raise DataSourceError(f"bad {what} in response: {str(value)[:50]!r}")
+    return number
 
 
 def to_int(value: Any, what: str) -> int:
     try:
         return int(value)
-    except (TypeError, ValueError):
-        raise DataSourceError(f"bad {what} in response: {value!r}") from None
+    except (TypeError, ValueError, OverflowError):  # OverflowError: infinity, or 1e400 read as a float
+        raise DataSourceError(f"bad {what} in response: {str(value)[:50]!r}") from None

@@ -14,7 +14,7 @@ never see a source's own format.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 import pandas as pd
@@ -167,6 +167,10 @@ def validate(candles: pd.DataFrame, timeframe: str) -> pd.DataFrame:
         raise ValueError("high and low must contain open and close")
     frame[PRICE_COLUMNS] = prices
     frame["volume"] = pd.to_numeric(frame["volume"]).astype(float)
+    volumes = frame["volume"].to_numpy()
+    known = ~np.isnan(volumes)
+    if np.isinf(volumes).any() or (volumes[known] < 0).any():
+        raise ValueError("volume must be finite and not negative (NaN when the source gives none)")
 
     if not pd.api.types.is_bool_dtype(frame["closed"]):
         raise ValueError("the closed column must be boolean")
@@ -175,14 +179,27 @@ def validate(candles: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     return frame.astype(_DTYPES)
 
 
+def steps_between(earlier: pd.Series | np.ndarray, later: pd.Series | np.ndarray, timeframe: str) -> np.ndarray:
+    """How many candles of ``timeframe`` lie from each open time in ``earlier`` to the one in ``later``.
+
+    Both are aligned open times. Fixed lengths count seconds; the month
+    timeframes count calendar months, so a month tail works like any other.
+    """
+    earlier = pd.Series(np.asarray(earlier, dtype="int64"))
+    later = pd.Series(np.asarray(later, dtype="int64"))
+    if timeframe in MONTH_TIMEFRAMES:
+        return ((_month_index(later) - _month_index(earlier)) // MONTH_TIMEFRAMES[timeframe]).to_numpy()
+    return ((later - earlier) // timeframe_seconds(timeframe)).to_numpy()
+
+
 def find_gaps(candles: pd.DataFrame, timeframe: str) -> list[Gap]:
     """List every place where candles are missing between two present ones."""
-    step = timeframe_seconds(timeframe)
     times = validate(candles, timeframe)["time"].to_numpy()
-    diffs = np.diff(times)
+    if len(times) < 2:
+        return []
+    steps = steps_between(times[:-1], times[1:], timeframe)
     return [
-        Gap(after=int(times[i]), before=int(times[i + 1]), missing=int(diffs[i] // step - 1))
-        for i in np.nonzero(diffs > step)[0]
+        Gap(after=int(times[i]), before=int(times[i + 1]), missing=int(steps[i] - 1)) for i in np.nonzero(steps > 1)[0]
     ]
 
 
@@ -367,7 +384,6 @@ def lay_over(stored: pd.DataFrame, fresh: pd.DataFrame, timeframe: str) -> tuple
     is the source's own history and is not in it, and neither is what is left
     of such a hole after the source filled a part of it.
     """
-    step = timeframe_seconds(timeframe)
     if fresh.empty:
         merged = stored
     elif stored.empty:
@@ -375,8 +391,9 @@ def lay_over(stored: pd.DataFrame, fresh: pd.DataFrame, timeframe: str) -> tuple
     else:
         first = int(fresh["time"].iloc[0])
         last = int(stored["time"].iloc[-1])
-        covered = last if bool(stored["closed"].iloc[-1]) else last - step
-        if first > covered + step or int(fresh["time"].iloc[-1]) < last:
+        # The fresh tail must begin no later than the first candle the stored ones lack.
+        limit = _next_open(last, timeframe) if bool(stored["closed"].iloc[-1]) else last
+        if first > limit or int(fresh["time"].iloc[-1]) < last:
             return None, []
         merged = pd.concat([stored[stored["time"] < first], fresh], ignore_index=True)
     merged = validate(merged, timeframe)
@@ -415,11 +432,127 @@ def hole_reach(candles: pd.DataFrame, timeframe: str, newest: int) -> int:
     ``newest`` candles, up to the last one. 0 when there is no such hole: a
     hole further back is the source's own history and is left alone.
     """
-    step = timeframe_seconds(timeframe)
     last = int(candles["time"].iloc[-1]) if len(candles) else 0
     reach = 0
     for gap in find_gaps(candles, timeframe):
-        need = (last - gap.after) // step + 1  # candle places from the one before the hole to the last
+        need = int(steps_between([gap.after], [last], timeframe)[0]) + 1  # from the candle before the hole to the last
         if need <= newest:
-            reach = max(reach, int(need))
+            reach = max(reach, need)
     return reach
+
+
+def _next_open(time: int, timeframe: str) -> int:
+    return int(following(pd.Series([int(time)]), timeframe).iloc[0])
+
+
+# What laying one stream candle over stored candles did (``lay_stream``).
+STREAM_SAME = "same"  # the newest stored candle got the stream's newer state
+STREAM_NEXT = "next"  # the stream's candle is the next one: appended, the one before it is closed now
+STREAM_OLD = "old"  # older than what is stored (or would reopen a closed candle): nothing changed
+STREAM_HOLE = "hole"  # one or more candles are missing between the stored ones and it: refill over REST
+
+
+def lay_stream(
+    stored: pd.DataFrame, bar: Mapping[str, Any], timeframe: str, *, keep_closed: bool = False
+) -> tuple[pd.DataFrame, str]:
+    """Stored candles with one candle from a live stream laid over them, and what that did.
+
+    ``bar`` has ``time`` (open, UTC seconds), ``open``, ``high``, ``low``,
+    ``close``, ``volume`` (NaN when unknown) and ``closed`` (the exchange's
+    own flag). The same open time as the newest stored candle replaces it;
+    the next open time is appended and the candle before it is then closed;
+    an older time changes nothing. A newer time further on is never built
+    over: the frame stays as it is and the outcome says a refill is needed.
+    A closed newest candle is not reopened by an update that says it is
+    still forming, and with ``keep_closed`` no closed candle is replaced at
+    all (the signal timeframe: what the rule ran on stays as it was).
+
+    The stored frame is never changed. The result is validated: sorted, no
+    two candles at one time. A bar that is not a valid candle of the
+    timeframe raises ValueError.
+    """
+    time = int(bar["time"])
+    row = {
+        "time": time,
+        "open": float(bar["open"]),
+        "high": float(bar["high"]),
+        "low": float(bar["low"]),
+        "close": float(bar["close"]),
+        "volume": float(bar["volume"]) if bar.get("volume") is not None else np.nan,
+        "closed": bool(bar["closed"]),
+    }
+    one = validate(pd.DataFrame([row]), timeframe)  # aligned, positive, high and low around open and close
+    if stored.empty:
+        return stored, STREAM_HOLE
+    last = int(stored["time"].iloc[-1])
+    if time < last:
+        return stored, STREAM_OLD
+    if time == last:
+        if bool(stored["closed"].iloc[-1]) and (keep_closed or not row["closed"]):
+            return stored, STREAM_OLD
+        laid = pd.concat([stored.iloc[:-1], one], ignore_index=True)
+        return validate(laid, timeframe), STREAM_SAME
+    if time != _next_open(last, timeframe):
+        return stored, STREAM_HOLE
+    before = stored.copy()
+    before.loc[before.index[-1], "closed"] = True
+    return validate(pd.concat([before, one], ignore_index=True), timeframe), STREAM_NEXT
+
+
+def older_changed(old: pd.DataFrame | None, new: pd.DataFrame, newest: int = 3) -> bool:
+    """Whether anything but the ``newest`` candles differs between two frames of one timeframe.
+
+    Compared over the times both frames cover, up to the ``newest``-th
+    newest candle of ``new``. A candle added at the new end or dropped at the
+    old end is no change: a page that follows the newest candles already has
+    everything else. A changed value, a candle that came or went further
+    back, or a candle that turned final further back than ``newest`` is.
+    """
+    if old is None or old.empty or new.empty:
+        return not ((old is None or old.empty) and new.empty)
+    cut = int(new["time"].iloc[-min(newest, len(new))])
+    low = max(int(old["time"].iloc[0]), int(new["time"].iloc[0]))
+    a = old[(old["time"] >= low) & (old["time"] < cut)]
+    b = new[(new["time"] >= low) & (new["time"] < cut)]
+    if len(a) != len(b):
+        return True
+    if not len(a):
+        return False
+    if not np.array_equal(a["time"].to_numpy(), b["time"].to_numpy()):
+        return True
+    if not np.array_equal(a["closed"].to_numpy(), b["closed"].to_numpy()):
+        return True
+    values = (*PRICE_COLUMNS, "volume")
+    return not np.array_equal(a[list(values)].to_numpy(float), b[list(values)].to_numpy(float), equal_nan=True)
+
+
+def lay_rest(stored: pd.DataFrame, tail: pd.DataFrame, timeframe: str, keep: int | None = None) -> pd.DataFrame | None:
+    """A short REST tail laid over stored candles that a live stream may have carried further.
+
+    A tail that reaches at least as far as the stored candles is laid as
+    ``merge`` lays it (None when it does not connect or opens a new hole:
+    the caller then loads the history again). One exception: a tail that
+    ends at the stored newest candle and still lists it as forming, while
+    the stored one is closed, comes from a copy that lags the exchange's
+    own closed flag. The stored closed candle is kept as it is: a closed
+    candle is never reopened, and never given values from before its
+    close. A tail that ends before the stored candles comes from a copy
+    that is behind the stream: its closed candles are final and replace the
+    stored ones at the same times; its forming candle is older than what
+    the stream gave and is not used, and no stored candle is removed.
+    """
+    if not tail.empty and not stored.empty and int(tail["time"].iloc[-1]) == int(stored["time"].iloc[-1]):
+        if bool(stored["closed"].iloc[-1]) and not bool(tail["closed"].iloc[-1]):
+            tail = pd.concat([tail.iloc[:-1], stored.iloc[-1:]], ignore_index=True)
+    if tail.empty or stored.empty or int(tail["time"].iloc[-1]) >= int(stored["time"].iloc[-1]):
+        return merge(stored, tail, timeframe, keep=keep)
+    final = tail[tail["closed"]].set_index("time")
+    laid = stored.copy()
+    hits = laid["time"].isin(final.index)
+    if hits.any():
+        times = laid.loc[hits, "time"]
+        for column in (*PRICE_COLUMNS, "volume"):
+            laid.loc[hits, column] = final.loc[times, column].to_numpy()
+        laid.loc[hits, "closed"] = True
+    laid = validate(laid, timeframe)
+    return laid.iloc[-keep:].reset_index(drop=True) if keep else laid

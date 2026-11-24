@@ -123,9 +123,10 @@ def test_a_source_without_intervals_of_its_own_shows_what_the_signal_candles_can
 def test_the_answer_names_its_source_and_marks_the_forming_candle():
     chart, *_ = make()
     answer = chart.candles("H4", 3)
+    # "rev" added on purpose (2026-11-23): the history counter (1 after the first load), also in stream events.
     assert {key: value for key, value in answer.items() if key != "bars"} == {
         "timeframe": "H4", "source": "fake", "symbol": "XAUTEST", "built_from": None,
-        "history": "full", "partial_first": False, "gaps": 0,
+        "history": "full", "partial_first": False, "gaps": 0, "rev": 1,
     }  # fmt: skip
     assert [item["time"] for item in answer["bars"]] == [at(2026, 11, 20, 4), at(2026, 11, 20, 8), at(2026, 11, 20, 12)]
     assert [item["closed"] for item in answer["bars"]] == [True, True, False]
@@ -334,3 +335,65 @@ def test_the_route_answers_503_with_a_wait_when_the_source_gives_no_candles(site
     assert response.status_code == 503 and response.headers["retry-after"] == "8"
     assert response.json() == {"detail": "the price source gave no candles"}
     assert member.get("/api/state").status_code == 200  # the rest of the site is not affected
+
+
+# --- months, empty answers, what the menu is told ---------------------------------------------------------
+
+
+def test_month_candles_are_refreshed_with_a_tail_like_any_other():
+    # Before 2026-11-23 a page on MN1 / MN3 / MN6 / MN12 made the server ask for all 240 months
+    # on every refresh: 30 requests and 7200 candles a minute. Now: one load, then 3-candle tails.
+    chart, source, clock, timer = make()
+    for _ in range(30):
+        chart.candles("MN3", 500)
+        pass_seconds(2.0, clock, timer)
+    assert source.calls[0] == ("MN1", 240) and set(source.calls[1:]) == {("MN1", 3)} and len(source.calls) == 30
+    pass_seconds(11 * 86400, clock, timer)  # December has begun
+    months = chart.candles("MN1", 3)["bars"]
+    assert [(item["time"], item["closed"]) for item in months] == [
+        (at(2026, 10), True), (at(2026, 11), True), (at(2026, 12), False),
+    ]  # fmt: skip
+    assert source.calls[-1] == ("MN1", 3) and len(chart.candles("MN1", 1500)["bars"]) == 84  # 2020-01 to 2026-12
+
+
+def test_an_empty_answer_is_never_stored_and_never_shown_as_a_chart(monkeypatch):
+    chart, source, clock, timer = make()
+    whole = source.fetch_candles
+    empty = [True]
+
+    def answer(timeframe: str, limit: int = 500) -> pd.DataFrame:
+        frame = whole(timeframe, limit)
+        return frame.iloc[:0].reset_index(drop=True) if empty[0] else frame
+
+    monkeypatch.setattr(source, "fetch_candles", answer)
+    with pytest.raises(ch.ChartUnavailable):
+        chart.candles("M5", 10)  # the first load came back empty
+    assert chart._kept["M5"].frame is None
+    empty[0] = False
+    pass_seconds(5, clock, timer)
+    kept = chart.candles("M5", 1500)["bars"]
+    empty[0] = True
+    pass_seconds(3, clock, timer)
+    with pytest.raises(ch.ChartUnavailable):
+        chart.candles("M5", 1500)  # an empty tail: not "nothing changed", a failed answer
+    assert ch._bars(chart._kept["M5"].frame) == kept  # the kept candles stay as they were
+    empty[0] = False
+    pass_seconds(5, clock, timer)
+    assert len(chart.candles("M5", 1500)["bars"]) == 1500
+
+
+def test_the_signal_timeframe_without_candles_yet_is_unavailable_not_empty():
+    clock, timer = Clock(NOW), Clock(1000.0)
+    chart = ch.ChartCandles(Native(clock), SimpleNamespace(timeframe="M15", frame=lambda: None), timer=timer)
+    for timeframe in ("M15", "M45"):
+        with pytest.raises(ch.ChartUnavailable):
+            chart.candles(timeframe, 10)
+
+
+def test_the_menu_is_told_why_a_timeframe_is_missing():
+    full, *_ = make()
+    assert full.missing() == {} and full.shortest() == "M1"
+    assert full.stream_info() == {"available": False, "timeframes": []}  # this fake has no stream
+    only_m15, *_ = make(timeframes=())
+    assert only_m15.shortest() == "M15"
+    assert only_m15.missing() == {tf: ch.NO_SHORTER for tf in ("M1", "M2", "M3", "M5", "M10")}
